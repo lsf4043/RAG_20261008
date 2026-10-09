@@ -1,0 +1,32 @@
+[
+  {
+    "question": "什么是RAG（检索增强生成）？",
+    "ground_truth": "RAG是一种结合信息检索与大语言模型生成的技术，先从知识库检索相关文档，再基于检索内容生成答案，以降低幻觉、提升准确性。",
+    "note": "事实型问题（单文档可回答）"
+  },
+  {
+    "question": "混合检索相比纯向量检索有什么优势？",
+    "ground_truth": "混合检索结合向量检索（语义相似）和BM25稀疏检索（关键词匹配），能兼顾语义理解与精确关键词匹配，提升召回率和鲁棒性。",
+    "note": "对比型问题"
+  },
+  {
+    "question": "查询改写和查询扩展分别解决什么问题？",
+    "ground_truth": "查询改写主要用于多轮对话中的指代消解，将模糊指代补全为完整问题；查询扩展（Multi-Query）生成多个语义等价变体以提升召回率。",
+    "note": "推理型问题（需综合多文档）"
+  },
+  {
+    "question": "CRAG（Corrective RAG）的核心流程是什么？",
+    "ground_truth": "CRAG先对检索结果做相关性评估，全部无关时触发查询改写重检索或联网搜索兜底，部分相关时过滤无关文档，从而修正检索质量。",
+    "note": "事实型问题"
+  },
+  {
+    "question": "LangSmith和Langfuse分别是什么？",
+    "ground_truth": "LangSmith和Langfuse都是LLM应用可观测性平台，用于追踪LLM调用链路、记录token消耗与延迟，帮助调试和优化。",
+    "note": "多跳/对比问题"
+  },
+  {
+    "question": "如何提升RAG效能量化评估？",
+    "ground_truth": "使用RAGAS等评估框架，计算忠实度（faithfulness）、答案相关性（answer_relevancy）、上下文精确率（context_precision）、上下文召回率（context_recall）等指标。",
+    "note": "事实型问题"
+  }
+]

@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 智能问答系统</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            opacity: 0.8;
+        }
+        
+        .tabs {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .tab-btn {
+            padding: 12px 30px;
+            border: none;
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+        
+        .tab-btn:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        
+        .tab-btn.active {
+            background: white;
+            color: #667eea;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            display: none;
+        }
+        
+        .card.active {
+            display: block;
+        }
+        
+        .card-title {
+            font-size: 1.5em;
+            margin-bottom: 20px;
+            color: #333;
+        }
+        
+        /* 上传区域 */
+        .upload-area {
+            border: 2px dashed #ddd;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-bottom: 20px;
+        }
+        
+        .upload-area:hover {
+            border-color: #667eea;
+            background: #f8f9ff;
+        }
+        
+        .upload-area.dragover {
+            border-color: #667eea;
+            background: #f0f3ff;
+        }
+        
+        .upload-icon {
+            font-size: 48px;
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+        
+        .upload-text {
+            color: #666;
+        }
+        
+        #fileInput {
+            display: none;
+        }
+        
+        .file-info {
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        
+        .file-info.show {
+            display: block;
+        }
+        
+        .btn {
+            padding: 12px 30px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-primary:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .btn-danger {
+            background: #ff5252;
+            color: white;
+        }
+        
+        .btn-danger:hover {
+            background: #ff1744;
+        }
+        
+        /* 日志区域 */
+        .log-area {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 8px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: 'Consolas', monospace;
+            font-size: 14px;
+            margin-top: 20px;
+        }
+        
+        .log-entry {
+            margin-bottom: 5px;
+            line-height: 1.5;
+        }
+        
+        .log-info { color: #4fc3f7; }
+        .log-success { color: #81c784; }
+        .log-warning { color: #ffb74d; }
+        .log-error { color: #e57373; }
+        
+        /* 问答区域 */
+        .chat-container {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        
+        .chat-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .session-info {
+            font-size: 14px;
+            color: #666;
+        }
+        
+        .chat-messages {
+            min-height: 300px;
+            max-height: 500px;
+            overflow-y: auto;
+            padding: 15px;
+            background: #f9f9f9;
+            border-radius: 10px;
+        }
+        
+        .message {
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 10px;
+        }
+        
+        .message-user {
+            background: #e3f2fd;
+            margin-left: 50px;
+        }
+        
+        .message-assistant {
+            background: #f5f5f5;
+            margin-right: 50px;
+        }
+        
+        .message-label {
+            font-size: 12px;
+            color: #999;
+            margin-bottom: 5px;
+        }
+        
+        .message-content {
+            line-height: 1.6;
+        }
+        
+        .input-area {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .input-area textarea {
+            flex: 1;
+            padding: 15px;
+            border: 2px solid #eee;
+            border-radius: 10px;
+            font-size: 16px;
+            resize: none;
+            transition: border-color 0.3s;
+        }
+        
+        .input-area textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        /* 来源信息 */
+        .sources {
+            margin-top: 15px;
+            padding: 15px;
+            background: #fff3e0;
+            border-radius: 8px;
+        }
+        
+        .source-item {
+            padding: 10px;
+            background: white;
+            border-radius: 5px;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        
+        .source-score {
+            color: #667eea;
+            font-weight: bold;
+        }
+        
+        /* 文档列表 */
+        .doc-list {
+            margin-top: 20px;
+        }
+        
+        .doc-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px;
+            background: #f5f5f5;
+            border-radius: 8px;
+            margin-bottom: 10px;
+        }
+        
+        .doc-info {
+            flex: 1;
+        }
+        
+        .doc-name {
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .doc-meta {
+            font-size: 12px;
+            color: #999;
+            margin-top: 5px;
+        }
+        
+        .btn-delete {
+            padding: 8px 15px;
+            background: #ff5252;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        
+        /* 进度条 */
+        .progress-bar {
+            height: 4px;
+            background: #eee;
+            border-radius: 2px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            width: 0%;
+            transition: width 0.3s;
+        }
+        
+        /* 加载动画 */
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        /* 响应式 */
+        @media (max-width: 768px) {
+            .header h1 {
+                font-size: 1.8em;
+            }
+            
+            .tabs {
+                flex-direction: column;
+            }
+            
+            .tab-btn {
+                width: 100%;
+            }
+            
+            .message-user {
+                margin-left: 20px;
+            }
+            
+            .message-assistant {
+                margin-right: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 AI 智能问答系统</h1>
+            <p>上传文档构建知识库，智能问答为您解答</p>
+        </div>
+        
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('upload')">📤 文档上传</button>
+            <button class="tab-btn" onclick="switchTab('chat')">💬 智能问答</button>
+            <button class="tab-btn" onclick="switchTab('docs')">📚 文档列表</button>
+        </div>
+        
+        <!-- 文档上传 -->
+        <div id="upload-card" class="card active">
+            <h2 class="card-title">上传文档到知识库</h2>
+            
+            <div class="upload-area" id="uploadArea">
+                <div class="upload-icon">📁</div>
+                <div class="upload-text">
+                    <p>拖拽文件到此处，或点击选择文件</p>
+                    <p style="font-size: 12px; margin-top: 10px; color: #999;">
+                        支持: PDF, Word, Excel, PPT, TXT, Markdown, HTML, 图片等
+                    </p>
+                </div>
+                <input type="file" id="fileInput" multiple>
+            </div>
+            
+            <div class="file-info" id="fileInfo">
+                <strong>已选择文件:</strong> <span id="fileName"></span>
+            </div>
+            
+            <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 15px;">
+                <label>分块大小:</label>
+                <input type="number" id="chunkSize" value="500" style="width: 80px; padding: 8px; border: 1px solid #ddd; border-radius: 5px;">
+                <label style="margin-left: 20px;">重叠大小:</label>
+                <input type="number" id="overlap" value="50" style="width: 80px; padding: 8px; border: 1px solid #ddd; border-radius: 5px;">
+                <label style="margin-left: 20px;">
+                    <input type="checkbox" id="useOcr"> 强制使用OCR
+                </label>
+            </div>
+            
+            <button class="btn btn-primary" id="uploadBtn" onclick="uploadFile()" disabled>
+                开始上传
+            </button>
+            
+            <div class="progress-bar" id="progressBar" style="display: none;">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            
+            <div class="log-area" id="uploadLog"></div>
+        </div>
+        
+        <!-- 智能问答 -->
+        <div id="chat-card" class="card">
+            <div class="chat-header">
+                <h2 class="card-title">智能问答</h2>
+                <div>
+                    <span class="session-info" id="sessionInfo"></span>
+                    <button class="btn btn-danger" onclick="clearSession()" style="padding: 8px 15px; font-size: 14px;">清空对话</button>
+                </div>
+            </div>
+            
+            <div class="chat-container">
+                <div class="chat-messages" id="chatMessages">
+                    <div class="message message-assistant">
+                        <div class="message-label">🤖 AI 助手</div>
+                        <div class="message-content">您好！我是 AI 智能问答助手。请先上传文档构建知识库，然后向我提问，我会基于知识库内容为您解答。</div>
+                    </div>
+                </div>
+                
+                <div class="input-area">
+                    <textarea id="questionInput" rows="3" placeholder="请输入您的问题..." onkeydown="handleKeyDown(event)"></textarea>
+                    <button class="btn btn-primary" id="sendBtn" onclick="sendQuestion()">
+                        发送
+                    </button>
+                </div>
+            </div>
+            
+            <div class="log-area" id="chatLog"></div>
+        </div>
+        
+        <!-- 文档列表 -->
+        <div id="docs-card" class="card">
+            <h2 class="card-title">已上传文档</h2>
+            <button class="btn btn-primary" onclick="loadDocs()" style="margin-bottom: 20px;">刷新列表</button>
+            <div class="doc-list" id="docList">
+                <p style="color: #999; text-align: center;">加载中...</p>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const API_BASE = window.location.origin + '/api/v1';
+        let selectedFiles = [];  // 改为数组支持多文件
+        let sessionId = null;  // 会话ID，用于多轮对话
+        
+        // 生成会话ID
+        function generateSessionId() {
+            return 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+        }
+        
+        // 初始化会话
+        function initSession() {
+            sessionId = generateSessionId();
+            document.getElementById('sessionInfo').textContent = '会话ID: ' + sessionId.substring(0, 20) + '...';
+        }
+        
+        // 页面加载时初始化会话
+        initSession();
+        
+        // 切换标签页
+        function switchTab(tab) {
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            document.querySelectorAll('.card').forEach(card => card.classList.remove('active'));
+            
+            event.target.classList.add('active');
+            document.getElementById(tab + '-card').classList.add('active');
+            
+            if (tab === 'docs') {
+                loadDocs();
+            }
+        }
+        
+        // 文件上传相关
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        
+        uploadArea.addEventListener('click', () => fileInput.click());
+        
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            handleFiles(e.dataTransfer.files);
+        });
+        
+        fileInput.addEventListener('change', () => {
+            handleFiles(fileInput.files);
+        });
+        
+        function handleFiles(files) {
+            if (files.length > 0) {
+                selectedFiles = Array.from(files);  // 存储所有文件
+                document.getElementById('fileInfo').classList.add('show');
+
+                // 显示文件信息
+                if (files.length === 1) {
+                    document.getElementById('fileName').textContent =
+                        files[0].name + ' (' + formatSize(files[0].size) + ')';
+                } else {
+                    const totalSize = selectedFiles.reduce((sum, file) => sum + file.size, 0);
+                    document.getElementById('fileName').textContent =
+                        `已选择 ${files.length} 个文件 (总大小: ${formatSize(totalSize)})`;
+                }
+
+                document.getElementById('uploadBtn').disabled = false;
+            }
+        }
+        
+        function formatSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+            return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+        }
+        
+        async function uploadFile() {
+            if (selectedFiles.length === 0) return;
+
+            const btn = document.getElementById('uploadBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span> 上传中...';
+
+            const logArea = document.getElementById('uploadLog');
+            logArea.innerHTML = '';
+
+            const progressBar = document.getElementById('progressBar');
+            const progressFill = document.getElementById('progressFill');
+            progressBar.style.display = 'block';
+            progressFill.style.width = '0%';
+
+            const formData = new FormData();
+            // 添加所有文件
+            selectedFiles.forEach(file => {
+                formData.append('files', file);
+            });
+            formData.append('chunk_size', document.getElementById('chunkSize').value);
+            formData.append('overlap', document.getElementById('overlap').value);
+            formData.append('use_ocr', document.getElementById('useOcr').checked);
+
+            try {
+                addLog(logArea, 'info', `开始上传 ${selectedFiles.length} 个文件...`);
+                progressFill.style.width = '10%';
+
+                const response = await fetch(`${API_BASE}/documents/upload/batch`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+                progressFill.style.width = '100%';
+
+                if (result.code === 200) {
+                    addLog(logArea, 'success', result.message);
+                    addLog(logArea, 'info', `总数: ${result.data.total} 个`);
+                    addLog(logArea, 'info', `成功: ${result.data.success_count} 个`);
+                    addLog(logArea, 'info', `失败: ${result.data.failed_count} 个`);
+
+                    // 显示每个文件的处理结果
+                    result.data.results.forEach((fileResult, index) => {
+                        addLog(logArea, 'info', `--- 文件 ${index + 1}: ${fileResult.filename} ---`);
+                        if (fileResult.success) {
+                            addLog(logArea, 'success', '处理成功');
+                            addLog(logArea, 'info', `文档ID: ${fileResult.document_id}`);
+                            addLog(logArea, 'info', `文档名称: ${fileResult.document_name}`);
+                            addLog(logArea, 'info', `文本块数: ${fileResult.total_chunks}`);
+                            addLog(logArea, 'info', `总字符数: ${fileResult.total_characters}`);
+                            addLog(logArea, 'info', `处理时间: ${fileResult.process_time.toFixed(2)}秒`);
+                        } else {
+                            addLog(logArea, 'error', `处理失败: ${fileResult.error}`);
+                        }
+                    });
+                } else {
+                    addLog(logArea, 'error', `上传失败: ${result.message}`);
+                }
+            } catch (error) {
+                addLog(logArea, 'error', `请求失败: ${error.message}`);
+            }
+
+            btn.disabled = false;
+            btn.innerHTML = '开始上传';
+            selectedFiles = [];
+            document.getElementById('fileInfo').classList.remove('show');
+            fileInput.value = '';
+        }
+        
+        function addLog(area, level, message) {
+            const entry = document.createElement('div');
+            entry.className = `log-entry log-${level}`;
+            const time = new Date().toLocaleTimeString();
+            entry.innerHTML = `[${time}] ${message}`;
+            area.appendChild(entry);
+            area.scrollTop = area.scrollHeight;
+        }
+        
+        // 问答相关
+        async function sendQuestion() {
+            const input = document.getElementById('questionInput');
+            const question = input.value.trim();
+            if (!question) return;
+            
+            const btn = document.getElementById('sendBtn');
+            btn.disabled = true;
+            
+            const messagesArea = document.getElementById('chatMessages');
+            const logArea = document.getElementById('chatLog');
+            logArea.innerHTML = '';
+            
+            // 添加用户消息
+            addMessage(messagesArea, 'user', question);
+            input.value = '';
+            
+            // 添加加载消息
+            const loadingMsg = document.createElement('div');
+            loadingMsg.className = 'message message-assistant';
+            loadingMsg.innerHTML = '<div class="message-label">🤖 AI 助手</div><div class="message-content"><span class="loading"></span> 思考中...</div>';
+            messagesArea.appendChild(loadingMsg);
+            messagesArea.scrollTop = messagesArea.scrollHeight;
+            
+            try {
+                addLog(logArea, 'info', `问题: ${question}`);
+                addLog(logArea, 'info', `会话ID: ${sessionId}`);
+                
+                const response = await fetch(`${API_BASE}/chat/query`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        question: question,
+                        session_id: sessionId,  // 传入会话ID
+                        top_k: 5,
+                        temperature: 0.7
+                    })
+                });
+                
+                const result = await response.json();
+                
+                // 移除加载消息
+                messagesArea.removeChild(loadingMsg);
+                
+                if (result.code === 200) {
+                    addMessage(messagesArea, 'assistant', result.data.answer);
+                    
+                    // 显示来源
+                    if (result.data.sources && result.data.sources.length > 0) {
+                        const sourcesDiv = document.createElement('div');
+                        sourcesDiv.className = 'sources';
+                        sourcesDiv.innerHTML = '<strong>📚 相关知识来源:</strong>';
+                        
+                        result.data.sources.forEach((source, i) => {
+                            const sourceItem = document.createElement('div');
+                            sourceItem.className = 'source-item';
+                            sourceItem.innerHTML = `
+                                <span class="source-score">相似度: ${(source.score * 100).toFixed(1)}%</span>
+                                <br>来源: ${source.document_name} (第${source.page_num}页)
+                                <br><span style="color: #666;">${source.text.substring(0, 100)}...</span>
+                            `;
+                            sourcesDiv.appendChild(sourceItem);
+                        });
+                        
+                        messagesArea.lastChild.appendChild(sourcesDiv);
+                    }
+                    
+                    addLog(logArea, 'success', `回答完成，耗时: ${result.data.process_time.toFixed(2)}秒`);
+                } else {
+                    addMessage(messagesArea, 'assistant', `抱歉，处理失败: ${result.message}`);
+                    addLog(logArea, 'error', result.message);
+                }
+            } catch (error) {
+                messagesArea.removeChild(loadingMsg);
+                addMessage(messagesArea, 'assistant', `抱歉，请求失败: ${error.message}`);
+                addLog(logArea, 'error', error.message);
+            }
+            
+            btn.disabled = false;
+            messagesArea.scrollTop = messagesArea.scrollHeight;
+        }
+        
+        // 清空对话
+        async function clearSession() {
+            if (!confirm('确定要清空对话历史吗？')) return;
+            
+            try {
+                const response = await fetch(`${API_BASE}/chat/session/clear`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId })
+                });
+                
+                const result = await response.json();
+                
+                if (result.code === 200) {
+                    // 清空消息区域
+                    const messagesArea = document.getElementById('chatMessages');
+                    messagesArea.innerHTML = `
+                        <div class="message message-assistant">
+                            <div class="message-label">🤖 AI 助手</div>
+                            <div class="message-content">对话已清空。请继续提问。</div>
+                        </div>
+                    `;
+                    
+                    // 生成新的会话ID
+                    initSession();
+                    
+                    alert('对话历史已清空');
+                } else {
+                    alert('清空失败: ' + result.message);
+                }
+            } catch (error) {
+                alert('清空失败: ' + error.message);
+            }
+        }
+        
+        function addMessage(area, type, content) {
+            const msg = document.createElement('div');
+            msg.className = `message message-${type}`;
+            
+            const label = type === 'user' ? '👤 您' : '🤖 AI 助手';
+            msg.innerHTML = `
+                <div class="message-label">${label}</div>
+                <div class="message-content">${content.replace(/\n/g, '<br>')}</div>
+            `;
+            area.appendChild(msg);
+            area.scrollTop = area.scrollHeight;
+        }
+        
+        function handleKeyDown(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendQuestion();
+            }
+        }
+        
+        // 文档列表
+        async function loadDocs() {
+            const listArea = document.getElementById('docList');
+            listArea.innerHTML = '<p style="color: #999; text-align: center;">加载中...</p>';
+            
+            try {
+                const response = await fetch(`${API_BASE}/documents/list`);
+                const result = await response.json();
+                
+                if (result.code === 200 && result.data.documents.length > 0) {
+                    listArea.innerHTML = '';
+                    result.data.documents.forEach(doc => {
+                        const item = document.createElement('div');
+                        item.className = 'doc-item';
+                        item.innerHTML = `
+                            <div class="doc-info">
+                                <div class="doc-name">${doc.document_name}</div>
+                                <div class="doc-meta">
+                                    类型: ${doc.file_type} | 
+                                    文本块: ${doc.chunk_count} | 
+                                    时间: ${doc.create_time || '未知'}
+                                </div>
+                            </div>
+                            <button class="btn-delete" onclick="deleteDoc('${doc.document_id}', this)">删除</button>
+                        `;
+                        listArea.appendChild(item);
+                    });
+                } else {
+                    listArea.innerHTML = '<p style="color: #999; text-align: center;">暂无文档</p>';
+                }
+            } catch (error) {
+                listArea.innerHTML = `<p style="color: #e57373; text-align: center;">加载失败: ${error.message}</p>`;
+            }
+        }
+        
+        async function deleteDoc(docId, btn) {
+            if (!confirm('确定要删除这个文档吗？')) return;
+            
+            btn.disabled = true;
+            btn.textContent = '删除中...';
+            
+            try {
+                const response = await fetch(`${API_BASE}/documents/${docId}`, { method: 'DELETE' });
+                const result = await response.json();
+                
+                if (result.code === 200) {
+                    loadDocs();
+                } else {
+                    alert('删除失败: ' + result.message);
+                    btn.disabled = false;
+                    btn.textContent = '删除';
+                }
+            } catch (error) {
+                alert('删除失败: ' + error.message);
+                btn.disabled = false;
+                btn.textContent = '删除';
+            }
+        }
+        
+        // 页面加载时检查服务状态
+        async function checkHealth() {
+            try {
+                const response = await fetch(`${API_BASE}/health`);
+                const result = await response.json();
+                console.log('服务状态:', result);
+            } catch (error) {
+                console.error('服务连接失败:', error);
+            }
+        }
+        
+        checkHealth();
+    </script>
+</body>
+</html>

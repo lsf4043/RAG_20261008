@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  # RAG 应用服务
+  rag-app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: rag-langgraph-v2
+    ports:
+      - "8000:8000"
+    environment:
+      # 通过环境变量注入（不硬编码密钥，由宿主机 .env 提供）
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - MILVUS_HOST=${MILVUS_HOST:-localhost}
+      - MILVUS_PORT=${MILVUS_PORT:-19530}
+      - MILVUS_COLLECTION=${MILVUS_COLLECTION:-rag_langgraph_v2}
+      - LANGCHAIN_TRACING_V2=${LANGCHAIN_TRACING_V2:-false}
+      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY:-}
+      - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT:-rag-langgraph-v2}
+    volumes:
+      - ../logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Milvus 向量库（如需本地部署，可取消注释）
+  # etcd:
+  #   image: quay.io/coreos/etcd:v3.5.5
+  #   environment:
+  #     - ETCD_AUTO_COMPACTION_MODE=revision
+  #     - ETCD_AUTO_COMPACTION_RETENTION=1000
+  #   volumes:
+  #     - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
+  #
+  # minio:
+  #   image: minio/minio:latest
+  #   environment:
+  #     MINIO_ACCESS_KEY: minioadmin
+  #     MINIO_SECRET_KEY: minioadmin
+  #   command: minio server /minio_data
+  #   volumes:
+  #     - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
+  #
+  # milvus:
+  #   image: milvusdb/milvus:v2.3.0
+  #   command: ["milvus", "run", "standalone"]
+  #   environment:
+  #     ETCD_ENDPOINTS: etcd:2379
+  #     MINIO_ADDRESS: minio:9000
+  #   ports:
+  #     - "19530:19530"
+  #     - "9091:9091"
+  #   depends_on:
+  #     - etcd
+  #     - minio

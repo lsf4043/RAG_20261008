@@ -1,0 +1,60 @@
+[project]
+name = "rag-langgraph-v2"
+version = "2.0.0"
+description = "基于 LangChain + LangGraph 的 Agentic RAG 智能问答系统"
+authors = [
+    {name = "RAG_LangGraph", email = "ai@example.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+    "langchain==1.2.15",
+    "langgraph==1.1.10",
+    "langchain-community>=0.3.0",
+    "langchain-milvus>=0.1.0",
+    "langsmith>=0.1.0",
+    "pymilvus>=2.3.0",
+    "dashscope>=1.14.0",
+    "sentence-transformers>=2.5.0",
+    "rank-bm25>=0.2.2",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "cachetools>=5.3.0",
+]
+
+[project.optional-dependencies]
+# 开发与测试依赖
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "httpx>=0.24.0",
+]
+# RAGAS 评估依赖
+evaluation = [
+    "ragas>=0.1.0",
+    "datasets>=2.14.0",
+]
+# 文档解析依赖
+parsing = [
+    "unstructured>=0.10.0",
+    "paddleocr>=2.7.0",
+    "paddlepaddle>=2.5.0",
+    "PyMuPDF>=1.23.0",
+    "pdfplumber>=0.9.0",
+    "python-docx>=0.8.11",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
