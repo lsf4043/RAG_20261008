@@ -1,280 +1,244 @@
 """
-复杂 PDF 解析器
-支持文本、表格、图片混合的 PDF 文档
+复杂 PDF 解析器（文本 + 表格 + 图片 OCR）
+
+相对旧实现的三处关键修复：
+
+1. **不再“有图就整页 OCR”**。旧逻辑对“含任意图片的每一页”都按 2 倍渲染整页再 OCR，
+   一份带页眉 logo 的 100 页 PDF 会做 100 次整页 OCR（分钟级），而且 OCR 文本会和
+   ``page.get_text()`` 已提取的文本重复入库，直接拉低 context_precision。
+   现在改为：**只有该页可提取文本量低于阈值（疑似扫描页）时才整页 OCR**，并把与已有
+   文本重复的行剔除。
+2. **表格不再重复三遍**。用 pdfplumber 的 ``table.bbox`` 把表格区域从 PyMuPDF 的文本块中
+   裁掉，表格只以 Markdown 形式出现一次。
+3. **依赖延迟导入**：没装 OCR / pdfplumber 时，服务仍能启动并处理其它格式。
 """
+from __future__ import annotations
+
 import os
-import io
 import tempfile
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import fitz  # PyMuPDF
-import pdfplumber
-from PIL import Image
-from paddleocr import PaddleOCR
-
+from app.config import settings
 from app.parsers.base import BaseParser, ParseResult
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+BBox = Tuple[float, float, float, float]
+
+
+def _import_fitz():
+    try:
+        import pymupdf as fitz  # PyMuPDF >= 1.24 推荐名称
+    except ImportError:  # pragma: no cover - 向后兼容
+        import fitz  # type: ignore[no-redef]
+    return fitz
+
+
+def _overlaps(a: BBox, b: BBox, threshold: float = 0.5) -> bool:
+    """a 与 b 的交集是否占 a 面积的一半以上"""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    inter_w = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    inter_h = max(0.0, min(ay1, by1) - max(ay0, by0))
+    inter = inter_w * inter_h
+    area = max((ax1 - ax0) * (ay1 - ay0), 1e-6)
+    return inter / area >= threshold
+
 
 class ComplexPDFParser(BaseParser):
-    """复杂 PDF 解析器，支持文本+表格+图片混合"""
+    """复杂 PDF 解析器"""
 
-    SUPPORTED_EXTENSIONS = ['pdf']
+    SUPPORTED_EXTENSIONS = ["pdf"]
 
-    def __init__(self):
-        """初始化解析器"""
-        logger.info("正在初始化复杂 PDF 解析器...")
-        self.ocr = PaddleOCR(lang="ch", use_angle_cls=True, show_log=False)
-        logger.info("复杂 PDF 解析器初始化完成")
+    def __init__(self) -> None:
+        logger.info("复杂 PDF 解析器就绪（OCR 模型按需加载）")
 
-    def parse(self, file_path: str, **kwargs) -> List[ParseResult]:
-        """
-        解析复杂 PDF 文档
+    # ==================== 主流程 ====================
+    def parse(self, file_path: str, force_ocr: bool = False, **kwargs) -> List[ParseResult]:
+        fitz = _import_fitz()
+        logger.info("开始解析 PDF: %s (force_ocr=%s)", file_path, force_ocr)
 
-        Args:
-            file_path: 文件路径
-
-        Returns:
-            解析结果列表
-        """
-        logger.info(f"开始解析复杂 PDF: {file_path}")
+        tables_by_page = self._extract_tables(file_path)
+        results: List[ParseResult] = []
 
         try:
-            results = []
-
-            # 1. 使用 pdfplumber 提取表格
-            logger.info("正在提取表格...")
-            tables_content = self._extract_tables(file_path)
-
-            # 2. 使用 PyMuPDF 检测并 OCR 图片区域
-            logger.info("正在提取图片中的文字...")
-            images_content = self._extract_images_text(file_path)
-
-            # 3. 使用 PyMuPDF 提取普通文本
-            logger.info("正在提取文本...")
-            text_content = self._extract_text(file_path)
-
-            # 4. 合并所有内容
-            all_content = []
-
-            for item in tables_content:
-                all_content.append({
-                    "type": "table",
-                    "page": item["page"],
-                    "text": item["text"],
-                    "priority": 1  # 表格优先级高
-                })
-
-            for item in images_content:
-                all_content.append({
-                    "type": "image",
-                    "page": item["page"],
-                    "text": item["text"],
-                    "priority": 2
-                })
-
-            for item in text_content:
-                all_content.append({
-                    "type": "text",
-                    "page": item["page"],
-                    "text": item["text"],
-                    "priority": 3
-                })
-
-            # 5. 按页面分组，合并内容
-            page_contents = {}
-            for item in all_content:
-                page_num = item["page"]
-                if page_num not in page_contents:
-                    page_contents[page_num] = []
-                page_contents[page_num].append(item)
-
-            # 6. 组装最终结果
-            for page_num in sorted(page_contents.keys()):
-                items = page_contents[page_num]
-                # 按优先级排序
-                items.sort(key=lambda x: x["priority"])
-
-                # 合并该页所有内容
-                page_text_parts = []
-                for item in items:
-                    if item["text"].strip():
-                        if item["type"] == "table":
-                            page_text_parts.append(f"[表格内容]\n{item['text']}")
-                        elif item["type"] == "image":
-                            page_text_parts.append(f"[图片文字]\n{item['text']}")
-                        else:
-                            page_text_parts.append(item["text"])
-
-                page_text = "\n\n".join(page_text_parts)
-
-                if page_text.strip():
-                    results.append(ParseResult(
-                        text=page_text,
-                        page_num=page_num,
-                        metadata={
-                            "parser": "complex_pdf",
-                            "has_table": any(i["type"] == "table" for i in items),
-                            "has_image": any(i["type"] == "image" for i in items)
-                        }
-                    ))
-
-            logger.info(f"复杂 PDF 解析完成，共 {len(results)} 页")
-            return results
-
-        except Exception as e:
-            logger.error(f"复杂 PDF 解析失败: {str(e)}")
+            document = fitz.open(file_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("打开 PDF 失败: %s", exc)
             return []
 
-    def _extract_tables(self, file_path: str) -> List[Dict]:
-        """使用 pdfplumber 提取表格"""
-        tables_content = []
-
         try:
-            with pdfplumber.open(file_path) as pdf:
-                for page_num, page in enumerate(pdf.pages):
-                    tables = page.extract_tables()
-                    for table in tables:
-                        if table:
-                            # 将表格转换为 Markdown 格式
-                            table_md = self._table_to_markdown(table)
-                            if table_md.strip():
-                                tables_content.append({
-                                    "page": page_num + 1,
-                                    "text": table_md
-                                })
-                                logger.info(f"第 {page_num + 1} 页提取到表格")
+            for page_index in range(len(document)):
+                page = document[page_index]
+                page_no = page_index + 1
+                tables = tables_by_page.get(page_no, [])
+                table_boxes = [bbox for bbox, _ in tables]
 
-        except Exception as e:
-            logger.error(f"表格提取失败: {str(e)}")
+                text = self._extract_page_text(page, table_boxes)
 
-        return tables_content
+                if force_ocr or self._needs_ocr(page, text):
+                    ocr_text = self._ocr_page(page)
+                    if ocr_text:
+                        text = self._merge_ocr(text, ocr_text)
+                        logger.info("第 %s 页使用 OCR 补充文本（%s 字符）", page_no, len(ocr_text))
 
-    def _table_to_markdown(self, table: List[List]) -> str:
-        """将表格转换为 Markdown 格式"""
-        if not table:
-            return ""
+                parts: List[str] = []
+                if text.strip():
+                    parts.append(text.strip())
+                for _, markdown in tables:
+                    parts.append(f"[表格内容]\n{markdown}")
 
-        lines = []
-
-        # 处理表头
-        header = table[0]
-        header = [str(cell) if cell else "" for cell in header]
-        lines.append("| " + " | ".join(header) + " |")
-        lines.append("| " + " | ".join(["---"] * len(header)) + " |")
-
-        # 处理数据行
-        for row in table[1:]:
-            row = [str(cell) if cell else "" for cell in row]
-            # 确保列数一致
-            while len(row) < len(header):
-                row.append("")
-            lines.append("| " + " | ".join(row[:len(header)]) + " |")
-
-        return "\n".join(lines)
-
-    def _extract_images_text(self, file_path: str) -> List[Dict]:
-        """提取 PDF 中图片的文字"""
-        images_content = []
-
-        try:
-            pdf_document = fitz.open(file_path)
-
-            for page_num in range(len(pdf_document)):
-                page = pdf_document[page_num]
-
-                # 获取页面中的图片
-                image_list = page.get_images(full=True)
-
-                if not image_list:
+                if not parts:
                     continue
 
-                # 渲染页面为图片进行 OCR（检测是否有图片中的文字）
-                mat = fitz.Matrix(2, 2)  # 放大2倍
-                pix = page.get_pixmap(matrix=mat)
-                img_data = pix.tobytes("png")
+                results.append(
+                    ParseResult(
+                        text="\n\n".join(parts),
+                        page_num=page_no,
+                        metadata={
+                            "parser": "complex_pdf",
+                            "has_table": bool(tables),
+                            "used_ocr": bool(force_ocr or self._needs_ocr(page, text)),
+                        },
+                    )
+                )
+        finally:
+            document.close()
 
-                # 保存临时图片
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                    tmp_path = tmp.name
-                    tmp.write(img_data)
+        logger.info("PDF 解析完成，共 %s 页", len(results))
+        return results
 
-                try:
-                    # OCR 识别
-                    ocr_result = self.ocr.ocr(tmp_path, cls=True)
-                    text_lines = self._extract_ocr_text(ocr_result)
-
-                    if text_lines:
-                        full_text = '\n'.join(text_lines)
-                        # 过滤掉已经通过普通文本提取的内容（避免重复）
-                        # 这里简单处理，实际可以通过位置对比来去重
-                        images_content.append({
-                            "page": page_num + 1,
-                            "text": full_text
-                        })
-                        logger.info(f"第 {page_num + 1} 页提取到图片文字")
-
-                finally:
-                    os.unlink(tmp_path)
-
-            pdf_document.close()
-
-        except Exception as e:
-            logger.error(f"图片文字提取失败: {str(e)}")
-
-        return images_content
-
-    def _extract_ocr_text(self, result) -> List[str]:
-        """从 OCR 结果提取文本"""
-        text_lines = []
-
-        for line in result:
-            if line:
-                for word_info in line:
-                    text = word_info[1][0]
-                    confidence = word_info[1][1]
-                    if confidence > 0.5:  # 置信度过滤
-                        text_lines.append(text)
-
-        return text_lines
-
-    def _extract_text(self, file_path: str) -> List[Dict]:
-        """使用 PyMuPDF 提取普通文本"""
-        text_content = []
-
+    # ==================== 文本 / 表格 ====================
+    def _extract_page_text(self, page, table_boxes: Sequence[BBox]) -> str:
+        """提取正文块（排除表格区域）"""
         try:
-            pdf_document = fitz.open(file_path)
+            blocks = page.get_text("blocks")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("提取页面文本失败: %s", exc)
+            return ""
 
-            for page_num in range(len(pdf_document)):
-                page = pdf_document[page_num]
-                text = page.get_text("text")
+        kept: List[Tuple[float, float, str]] = []
+        for block in blocks:
+            try:
+                x0, y0, x1, y1, text = block[0], block[1], block[2], block[3], block[4]
+            except (IndexError, TypeError):
+                continue
+            if not isinstance(text, str) or not text.strip():
+                continue
+            box = (float(x0), float(y0), float(x1), float(y1))
+            if any(_overlaps(box, table_box) for table_box in table_boxes):
+                continue
+            kept.append((float(y0), float(x0), text.strip()))
 
-                if text.strip():
-                    text_content.append({
-                        "page": page_num + 1,
-                        "text": text.strip()
-                    })
+        kept.sort(key=lambda item: (item[0], item[1]))
+        return "\n".join(item[2] for item in kept)
 
-            pdf_document.close()
+    def _extract_tables(self, file_path: str) -> Dict[int, List[Tuple[BBox, str]]]:
+        """用 pdfplumber 提取表格，并返回 bbox 以便从正文中裁掉"""
+        try:
+            import pdfplumber
+        except ImportError:
+            logger.warning("未安装 pdfplumber，跳过表格提取")
+            return {}
 
-        except Exception as e:
-            logger.error(f"文本提取失败: {str(e)}")
+        tables: Dict[int, List[Tuple[BBox, str]]] = {}
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                for page_index, page in enumerate(pdf.pages, start=1):
+                    if hasattr(page, "find_tables"):
+                        found = page.find_tables()
+                        for table in found:
+                            markdown = self._table_to_markdown(table.extract())
+                            if markdown:
+                                bbox = tuple(float(v) for v in table.bbox)  # type: ignore[assignment]
+                                tables.setdefault(page_index, []).append((bbox, markdown))
+                    else:  # 老版本 pdfplumber
+                        for raw in page.extract_tables():
+                            markdown = self._table_to_markdown(raw)
+                            if markdown:
+                                tables.setdefault(page_index, []).append(
+                                    ((0.0, 0.0, 0.0, 0.0), markdown)
+                                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("表格提取失败（忽略表格）: %s", exc)
+        return tables
 
-        return text_content
+    @staticmethod
+    def _table_to_markdown(table: Optional[List[List[Any]]]) -> str:
+        if not table or not table[0]:
+            return ""
+        rows = [[("" if cell is None else str(cell).replace("\n", " ").strip()) for cell in row] for row in table]
+        header = rows[0]
+        width = len(header)
+        lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * width) + " |"]
+        for row in rows[1:]:
+            row = (row + [""] * width)[:width]
+            lines.append("| " + " | ".join(row) + " |")
+        return "\n".join(lines)
+
+    # ==================== OCR ====================
+    @staticmethod
+    def _needs_ocr(page, extracted_text: str) -> bool:
+        """仅在“疑似扫描页”时 OCR：可提取文本很少"""
+        if len(extracted_text.strip()) >= settings.OCR_TEXT_THRESHOLD:
+            return False
+        try:
+            has_images = bool(page.get_images(full=True))
+        except Exception:  # noqa: BLE001
+            has_images = False
+        # 文本极少：无论有没有图片都值得 OCR 一次（矢量文字也可能提取失败）
+        return has_images or not extracted_text.strip()
+
+    def _ocr_page(self, page) -> str:
+        fitz = _import_fitz()
+        tmp_path: Optional[str] = None
+        try:
+            matrix = fitz.Matrix(2, 2)
+            pixmap = page.get_pixmap(matrix=matrix)
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp.write(pixmap.tobytes("png"))
+                tmp_path = tmp.name
+
+            from app.parsers.ocr_engine import ocr_image
+
+            lines = ocr_image(tmp_path)
+            return "\n".join(lines)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("页面 OCR 失败: %s", exc)
+            return ""
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _merge_ocr(extracted_text: str, ocr_text: str) -> str:
+        """把 OCR 结果合并进正文，剔除与已有文本重复的行"""
+        existing = {line.strip() for line in extracted_text.splitlines() if line.strip()}
+        existing_blob = extracted_text.replace(" ", "")
+        extra: List[str] = []
+        for line in ocr_text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped in existing:
+                continue
+            if stripped.replace(" ", "") and stripped.replace(" ", "") in existing_blob:
+                continue
+            extra.append(stripped)
+        if not extra:
+            return extracted_text
+        return (extracted_text + "\n" + "\n".join(extra)).strip()
 
     def supported_extensions(self) -> List[str]:
-        """支持的文件扩展名"""
         return self.SUPPORTED_EXTENSIONS
 
 
-# 全局解析器实例（延迟初始化）
-_complex_pdf_parser = None
+_complex_pdf_parser: Optional[ComplexPDFParser] = None
 
 
 def get_complex_pdf_parser() -> ComplexPDFParser:
-    """获取复杂 PDF 解析器实例"""
     global _complex_pdf_parser
     if _complex_pdf_parser is None:
         _complex_pdf_parser = ComplexPDFParser()

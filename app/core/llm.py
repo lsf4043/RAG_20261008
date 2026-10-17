@@ -1,16 +1,22 @@
 """
-大模型服务（LangChain 版）
-使用 LangChain 的 ChatDashScope 替代旧版手写 dashscope 调用。
+大模型服务（DeepSeek，OpenAI 兼容接口）
 
-优化点：
-- 使用 LangChain 标准 ChatModel 接口（invoke / stream / bind_tools），与 LangGraph 无缝集成
-- 支持结构化输出（with_structured_output），用于 CRAG 文档评分等需要稳定格式的场景
-- 通过 LangChain 自动上报 LangSmith（无需额外埋点）
+相对旧版的关键修复：
+- **不再在 import 阶段构造客户端**：改为首次使用时懒加载，单元测试 / /docs /
+  健康检查不需要真实密钥；
+- **不再每次调用都新建 ChatOpenAI**：按 (temperature, max_tokens) 复用
+  ``model_copy`` 出来的轻量变体，底层 httpx 连接池共用；
+- 统一超时与重试（LLM_TIMEOUT / LLM_MAX_RETRIES）；
+- 提供 ``structured()`` 供 CRAG 批评分、Query 改写等场景做结构化输出。
 """
-from typing import List, Dict, Optional, AsyncGenerator, Any
+from __future__ import annotations
 
-from langchain_community.chat_models import ChatTongyi
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
+import threading
+from functools import lru_cache
+from typing import Any, AsyncGenerator, Dict, List, Optional, Sequence
+
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from app.config import settings
 from app.utils.logger import get_logger
@@ -18,51 +24,94 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-class LLMService:
-    """阿里百炼大模型服务（基于 LangChain ChatDashScope）"""
+def _to_text(content: Any) -> str:
+    """兼容 OpenAI 返回 str 或 content blocks 两种情况"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") in {"text", "output_text"}:
+                parts.append(str(block.get("text", "")))
+        return "".join(parts)
+    return str(content)
 
-    def __init__(self):
-        self.model = settings.LLM_MODEL
+
+class LLMService:
+    """DeepSeek 大模型服务"""
+
+    def __init__(self) -> None:
+        self.model = settings.DEEPSEEK_MODEL
         self.max_tokens = settings.LLM_MAX_TOKENS
         self.temperature = settings.LLM_TEMPERATURE
+        self._base: Any = None
+        self._variants: Dict[tuple, Any] = {}
+        self._lock = threading.Lock()
 
-        # 初始化 LangChain ChatTongyi（DashScope 通义千问）
-        self._llm = ChatTongyi(
+    # ---------- 客户端 ----------
+    def is_configured(self) -> bool:
+        return bool(settings.DEEPSEEK_API_KEY)
+
+    def _create_base(self) -> Any:
+        settings.require_deepseek_key()
+        return init_chat_model(
             model=self.model,
-            dashscope_api_key=settings.DASHSCOPE_API_KEY,
-            model_kwargs={
-                "temperature": self.temperature,
-                "max_tokens": self.max_tokens,
-            },
+            model_provider="openai",
+            api_key=settings.DEEPSEEK_API_KEY,
+            base_url=settings.DEEPSEEK_BASE_URL,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            timeout=settings.LLM_TIMEOUT,
+            max_retries=settings.LLM_MAX_RETRIES,
         )
-        logger.info(f"LangChain 大模型初始化完成，模型: {self.model}")
 
-    def get_llm(self) -> ChatTongyi:
-        """获取底层 ChatDashScope 实例（供 LangChain 链 / LangGraph 使用）"""
-        return self._llm
+    @property
+    def base(self) -> Any:
+        """底层 ChatModel（懒加载 + 线程安全）"""
+        if self._base is None:
+            with self._lock:
+                if self._base is None:
+                    self._base = self._create_base()
+                    logger.info("LangChain 大模型初始化完成，模型: %s", self.model)
+        return self._base
 
+    def get_llm(self) -> Any:
+        return self.base
+
+    def _variant(self, temperature: Optional[float] = None, max_tokens: Optional[int] = None) -> Any:
+        """按参数复用模型变体（共享底层连接池，不重复创建客户端）"""
+        updates: Dict[str, Any] = {}
+        if temperature is not None:
+            updates["temperature"] = temperature
+        if max_tokens is not None:
+            updates["max_tokens"] = max_tokens
+        if not updates:
+            return self.base
+
+        key = tuple(sorted(updates.items()))
+        with self._lock:
+            variant = self._variants.get(key)
+            if variant is None:
+                variant = self.base.model_copy(update=updates)
+                self._variants[key] = variant
+            return variant
+
+    def structured(self, schema: Any, temperature: float = 0.0, max_tokens: Optional[int] = None) -> Any:
+        """返回绑定了结构化输出 schema 的 runnable"""
+        return self._variant(temperature=temperature, max_tokens=max_tokens).with_structured_output(schema)
+
+    # ---------- 消息转换 ----------
     def _to_messages(
-        self,
-        messages: List[Dict],
-        system_prompt: Optional[str] = None
+        self, messages: Sequence[Dict[str, str]], system_prompt: Optional[str] = None
     ) -> List[BaseMessage]:
-        """
-        将字典格式消息转换为 LangChain 消息对象
-
-        Args:
-            messages: 消息列表 [{role: user/assistant/system, content: ...}]
-            system_prompt: 系统提示（可选，放在最前）
-
-        Returns:
-            LangChain 消息列表
-        """
         result: List[BaseMessage] = []
         if system_prompt:
             result.append(SystemMessage(content=system_prompt))
-
         for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
+            role = (msg or {}).get("role", "user")
+            content = (msg or {}).get("content", "")
             if role == "system":
                 result.append(SystemMessage(content=content))
             elif role == "assistant":
@@ -71,132 +120,84 @@ class LLMService:
                 result.append(HumanMessage(content=content))
         return result
 
+    # ---------- 同步接口 ----------
     def chat(
         self,
-        messages: List[Dict],
+        messages: Sequence[Dict[str, str]],
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
     ) -> str:
-        """
-        同步对话生成
+        response = self._variant(temperature, max_tokens).invoke(
+            self._to_messages(messages, system_prompt)
+        )
+        return _to_text(response.content)
 
-        Args:
-            messages: 消息列表
-            system_prompt: 系统提示
-            temperature: 温度（可选，覆盖默认）
-            max_tokens: 最大 token 数（可选，覆盖默认）
+    def invoke_messages(
+        self,
+        messages: Sequence[BaseMessage],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        response = self._variant(temperature, max_tokens).invoke(list(messages))
+        return _to_text(response.content)
 
-        Returns:
-            生成的回答
-        """
-        langchain_messages = self._to_messages(messages, system_prompt)
-        llm = self._llm
-        # 如果指定了温度/token，则临时构建一个覆盖参数的实例
-        if temperature is not None or max_tokens is not None:
-            llm = ChatTongyi(
-                model=self.model,
-                dashscope_api_key=settings.DASHSCOPE_API_KEY,
-                model_kwargs={
-                    "temperature": temperature or self.temperature,
-                    "max_tokens": max_tokens or self.max_tokens,
-                },
-            )
-
-        response = llm.invoke(langchain_messages)
-        answer = response.content if isinstance(response.content, str) else str(response.content)
-        logger.info(f"大模型响应完成，生成 {len(answer)} 字符")
-        return answer
-
+    # ---------- 异步接口 ----------
     async def achat(
         self,
-        messages: List[Dict],
+        messages: Sequence[Dict[str, str]],
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
     ) -> str:
-        """
-        异步对话生成
+        response = await self._variant(temperature, max_tokens).ainvoke(
+            self._to_messages(messages, system_prompt)
+        )
+        return _to_text(response.content)
 
-        Args:
-            messages: 消息列表
-            system_prompt: 系统提示
-            temperature: 温度
-            max_tokens: 最大 token 数
-
-        Returns:
-            生成的回答
-        """
-        langchain_messages = self._to_messages(messages, system_prompt)
-        response = await self._llm.ainvoke(langchain_messages)
-        answer = response.content if isinstance(response.content, str) else str(response.content)
-        logger.info(f"大模型（异步）响应完成，生成 {len(answer)} 字符")
-        return answer
+    async def ainvoke_messages(
+        self,
+        messages: Sequence[BaseMessage],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        response = await self._variant(temperature, max_tokens).ainvoke(list(messages))
+        return _to_text(response.content)
 
     async def astream(
         self,
-        messages: List[Dict],
+        messages: Sequence[Dict[str, str]],
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
     ) -> AsyncGenerator[str, None]:
-        """
-        异步流式对话生成
+        async for chunk in self._variant(temperature, max_tokens).astream(
+            self._to_messages(messages, system_prompt)
+        ):
+            text = _to_text(chunk.content)
+            if text:
+                yield text
 
-        Args:
-            messages: 消息列表
-            system_prompt: 系统提示
-            temperature: 温度
-            max_tokens: 最大 token 数
-
-        Yields:
-            生成的文本片段
-        """
-        langchain_messages = self._to_messages(messages, system_prompt)
-        llm = self._llm
-        if temperature is not None or max_tokens is not None:
-            llm = ChatTongyi(
-                model=self.model,
-                dashscope_api_key=settings.DASHSCOPE_API_KEY,
-                model_kwargs={
-                    "temperature": temperature or self.temperature,
-                    "max_tokens": max_tokens or self.max_tokens,
-                },
-            )
-
-        async for chunk in llm.astream(langchain_messages):
-            content = chunk.content
-            if content:
-                yield content if isinstance(content, str) else str(content)
-
-    def invoke_messages(self, messages: List[BaseMessage]) -> str:
-        """
-        直接调用（接收 LangChain 消息对象，供 LangGraph 节点使用）
-
-        Args:
-            messages: LangChain 消息列表
-
-        Returns:
-            生成的回答
-        """
-        response = self._llm.invoke(messages)
-        answer = response.content if isinstance(response.content, str) else str(response.content)
-        return answer
-
-    async def ainvoke_messages(self, messages: List[BaseMessage]) -> str:
-        """
-        异步直接调用（接收 LangChain 消息对象，供 LangGraph 节点使用）
-
-        Args:
-            messages: LangChain 消息列表
-
-        Returns:
-            生成的回答
-        """
-        response = await self._llm.ainvoke(messages)
-        answer = response.content if isinstance(response.content, str) else str(response.content)
-        return answer
+    async def astream_messages(
+        self,
+        messages: Sequence[BaseMessage],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> AsyncGenerator[str, None]:
+        """对已构造好的 BaseMessage 列表做 token 级流式输出"""
+        async for chunk in self._variant(temperature, max_tokens).astream(list(messages)):
+            text = _to_text(chunk.content)
+            if text:
+                yield text
 
 
-# 全局大模型服务实例
-llm_service = LLMService()
+@lru_cache(maxsize=1)
+def get_llm_service() -> LLMService:
+    return LLMService()
+
+
+def __getattr__(name: str) -> Any:
+    """兼容旧的 ``from app.core.llm import llm_service`` 写法（懒加载）"""
+    if name == "llm_service":
+        return get_llm_service()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

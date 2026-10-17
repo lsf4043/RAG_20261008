@@ -1,47 +1,51 @@
-# ============ Web============
-fastapi>=0.100.0
-uvicorn[standard]>=0.23.0
-python-multipart>=0.0.6
+# 运行依赖（与 pyproject.toml 的 [project].dependencies 保持一致）
+# 完整安装（含解析能力）：pip install -r requirements.txt
+# 精简安装（只要问答）：pip install -e .
+# ============ Web ============
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
 websockets>=12.0
 
-# ============ LangChain / LangGraph============
+# ============ 配置 ============
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.0
+
+# ============ LangChain / LangGraph ============
 langchain==1.2.15
 langgraph==1.1.10
-langchain-community>=0.3.0
-langchain-milvus>=0.1.0
-langchain-core>=0.3.0
+langchain-core>=1.0.0
+langchain-community>=0.4.0
+langchain-openai>=1.0.0
+langchain-text-splitters>=1.0.0
 
-# ============ LangSmith============
-langsmith>=0.1.0
+# ============ Milvus ============
+langchain-milvus>=0.3.0
+pymilvus>=2.6.0
 
-# ============milvus============
-pymilvus>=2.3.0
-
+# ============ Embedding / 检索 / 重排 ============
 dashscope>=1.14.0
-
-# ============ BM25 ============
-sentence-transformers>=2.5.0
 rank-bm25>=0.2.2
+sentence-transformers>=2.5.0
+cachetools>=5.3.0
 
-# ============ RAGAS============
-ragas>=0.1.0
-datasets>=2.14.0
+# ============ 可观测性 ============
+langsmith>=0.2.0
 
+# ============ 文档解析（体积较大；不需要可整段删除）============
+# paddleocr 必须锁 2.x：3.x 改了构造参数与返回结构
 unstructured>=0.10.0
-paddleocr>=2.7.0
+paddleocr>=2.7.0,<3.0.0
 paddlepaddle>=2.5.0
 PyMuPDF>=1.23.0
-pdfplumber>=0.9.0
+pdfplumber>=0.10.0
 python-docx>=0.8.11
 docx2txt>=0.8
-
 Pillow>=10.0.0
 
-python-dotenv>=1.0.0
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
-aiofiles>=23.0.0
-httpx>=0.24.0
-cachetools>=5.3.0
 python-magic-bin>=0.4.14; sys_platform == 'win32'
 python-magic>=0.4.27; sys_platform != 'win32'
+
+# 说明：RAGAS / datasets 仅用于评估，不再放进运行依赖。
+# 需要时：pip install -e ".[evaluation]"

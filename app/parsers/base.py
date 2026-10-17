@@ -1,17 +1,20 @@
 """
 文档解析器基类
 """
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
 
 
 @dataclass
 class ParseResult:
-    """解析结果"""
-    text: str  # 文本内容
-    page_num: int = 0  # 页码
-    metadata: Dict[str, Any] = None  # 元数据
+    """解析结果（按页返回）"""
+
+    text: str
+    page_num: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class BaseParser(ABC):
@@ -19,36 +22,11 @@ class BaseParser(ABC):
 
     @abstractmethod
     def parse(self, file_path: str, **kwargs) -> List[ParseResult]:
-        """
-        解析文档
-
-        Args:
-            file_path: 文件路径
-            **kwargs: 其他参数
-
-        Returns:
-            解析结果列表
-        """
-        pass
+        """解析文档"""
 
     @abstractmethod
     def supported_extensions(self) -> List[str]:
-        """
-        支持的文件扩展名
-
-        Returns:
-            扩展名列表 (小写)
-        """
-        pass
+        """支持的文件扩展名（小写、不带点）"""
 
     def can_parse(self, file_extension: str) -> bool:
-        """
-        检查是否支持该文件类型
-
-        Args:
-            file_extension: 文件扩展名
-
-        Returns:
-            是否支持
-        """
-        return file_extension.lower() in self.supported_extensions()
+        return file_extension.lower().lstrip(".") in self.supported_extensions()

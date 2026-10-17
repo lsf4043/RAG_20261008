@@ -1,143 +1,303 @@
-# RAG 智能问答系统（LangGraph 版）
+# RAG 智能问答系统（LangGraph 版）v2.1
 
-基于 **LangChain + LangGraph** 的 Agentic RAG（检索增强生成）系统，在原有 RAG 项目基础上升级而来，实现了从 **Advanced RAG** 到 **Modular/Agentic RAG** 的架构跃迁。
+基于 **LangChain + LangGraph** 的 Agentic RAG 系统：混合检索（向量 + BM25 + 加权 RRF）、
+Query 改写/扩展、CRAG 批量相关性评估与重检索、Cross-Encoder 重排、引用溯源、可选拒答策略。
 
-## 技术栈
+> v2.1 是一次**以「可运行、可验证、不骗人」为目标的修复版本**。v2.0 的架构方向正确，
+> 但存在多处“代码存在但行为不成立”的问题（服务起不来、删除不生效、重检索空转、
+> 评估跑不通）。下面第 2 节逐条列出改了什么、为什么改。
 
-| 组件 | 技术 | 说明 |
-|------|------|------|
-| Web 框架 | FastAPI + Uvicorn | 异步 API 服务 |
-| 编排框架 | LangGraph 1.1.10 | 状态机编排 RAG 流程 |
-| 组件库 | LangChain 1.2.15 | 标准 Embedding/LLM/Retriever/Reranker 接口 |
-| 向量库 | Milvus（langchain-milvus） | HNSW 索引向量检索 |
-| LLM / Embedding | 阿里百炼（DashScope） | qwen-turbo / text-embedding-v2 |
-| 重排序 | BAAI/bge-reranker-base | Cross-Encoder 重排序 |
-| 可观测性 | LangSmith | LLM 调用全链路追踪 |
-| 评估 | RAGAS | 检索/生成质量量化评估 |
-| 文档解析 | PaddleOCR + pdfplumber + PyMuPDF | 多格式文档解析 |
+---
 
-## 核心特性（相对旧版升级）
+## 1. 技术栈
 
-### ✅ P0 优化（已实现）
-- **LangGraph 状态机**：RAG 流程由线性硬编码重构为可编排的状态机
-- **LangChain 组件化**：Embedding/LLM/VectorStore/BM25/Reranker 全部迁移到 LangChain 标准接口
-- **RAGAS 评估**：`tests/evaluation/` 提供自动化质量评估
-- **LangSmith 可观测性**：环境变量自动追踪（`LANGCHAIN_TRACING_V2=true`）
+| 组件 | 技术 |
+|------|------|
+| Web 框架 | FastAPI + Uvicorn |
+| 编排 | LangGraph 1.1.x（检索子图 + 生成节点） |
+| 组件库 | LangChain 1.2.x（ChatModel / Embeddings / Retriever / CrossEncoder） |
+| 向量库 | Milvus（langchain-milvus 0.4.x / pymilvus 3.x，HNSW + COSINE） |
+| LLM | DeepSeek（OpenAI 兼容接口） |
+| Embedding | 阿里百炼 DashScope `text-embedding-v2` |
+| 重排 | `BAAI/bge-reranker-base`（sentence-transformers CrossEncoder） |
+| 可观测 | LangSmith（环境变量自动追踪 + 业务级 `@traceable`） |
+| 评估 | RAGAS（含消融对比） |
+| 解析 | PyMuPDF + pdfplumber + PaddleOCR + python-docx + unstructured |
 
-### ✅ P1 优化（已实现）
-- **Query 改写/扩展**：多轮指代消解 + Multi-Query 扩展 + HyDE
-- **Corrective RAG（CRAG）**：检索质量评估 + 自动重检索
-- **缓存机制**：Embedding 缓存 + 查询结果缓存
+---
 
-## 架构流程（LangGraph 状态机）
+## 2. v2.1 修复清单
+
+### 2.1 阻断级（不修就跑不起来 / 数据悄悄错）
+
+| # | 问题 | 根因 | 修复 |
+|---|------|------|------|
+| 1 | 服务启动即崩 | `lifespan` 缺 `app` 参数，Starlette 调用 `lifespan_context(app)` 抛 `TypeError` | 签名改为 `async def lifespan(app: FastAPI)`，并把日志配置移进 lifespan |
+| 2 | 上传后元数据丢失 | langchain-milvus 默认 `enable_dynamic_field=False`，集合 schema 由**第一个文档**的 metadata 键固化，后续新键被静默丢弃；metadata 里的 `content` 与 text_field 同名还会触发 `Metadata key is reserved` | 显式 `enable_dynamic_field=True`，metadata 键改名 `raw_content`，并显式传主键 id |
+| 3 | 删除文档不生效 | 删除表达式写成 `metadata["document_id"] == ...`，但集合里没有名为 `metadata` 的 JSON 字段 | 改为顶层字段 `document_id == "..."`，并对 id 做白名单校验（防表达式注入）；删除失败不再返回成功 |
+| 4 | 重启后混合检索静默退化 | BM25 索引只存在进程内存里，进程重启即空，且代码只判断 `count > 0` 不报错 | 新增 `bootstrap_bm25()`：启动时从 Milvus 全量读回 chunk 重建索引；索引不可用时在响应里标 `degraded` |
+| 5 | 知识库更新后答案仍旧 | 查询缓存 key 只有 `question + top_k`，上传/删除后从不失效 | key 增加会话历史摘要；上传/删除/批量重建后调用 `invalidate_query_cache()` |
+
+### 2.2 正确性
+
+| # | 问题 | 修复 |
+|---|------|------|
+| 6 | **CRAG 重检索是空转**：`query_rewrite_node` 输入不变，重试必然拿到同一批 query | 重试时回灌“上一轮失败的 query”作为提示、逐轮放宽 `candidate_k`；无任何改写能力时直接跳过重试 |
+| 7 | CRAG 每篇文档一次 LLM 调用（20~60 次/问题） | 改为**一次调用批量判定**（`_GradeBatch` 结构化输出），单问题 LLM 往返从 60+ 降到 3~4 次 |
+| 8 | 跨页 `chunk_id` 重号 → 不同内容被 RRF 合并成一类 | `split_text(..., start_chunk_id=...)` 全局连续编号；去重 key 加入 `page_num`；`hash()` 换成 sha1 |
+| 9 | 节点就地修改共享 Document（BM25 索引里的对象），并发会串分数 | 所有分数写入 Document **副本**，节点只返回局部状态更新 |
+| 10 | 检索不到内容时仍让 LLM 自由作答，用户以为答案来自知识库 | 新增 `ALLOW_LLM_FALLBACK`（默认 false）→ 直接拒答；API 返回 `used_fallback / degraded / notes`，前端显式提示 |
+| 11 | `VECTOR_WEIGHT` / `BM25_WEIGHT` / `MAX_RETRIES` / 接口的 `top_k`、`temperature` 全是“假旋钮” | RRF 支持通道加权；重试接入 Milvus 操作；请求参数写入 state 并在生成阶段生效 |
+| 12 | 章节识别首行标题被丢弃（`pos > last_pos + 10` 且 `last_pos=-1`） | 修正边界判断（这是原代码里就存在的 bug，被新增单测抓出来） |
+| 13 | 健康检查永远返回 healthy | `/health` 如实计算状态；新增 `/health/ready`（真正 ping Milvus + 校验 schema，未就绪返回 503） |
+| 14 | 流式问答手写了一遍检索链，与状态机双份实现 | 拆出**检索子图**，非流式（完整图）与流式（检索子图 + token 流）共用同一份检索逻辑 |
+
+### 2.3 性能与成本
+
+| # | 问题 | 修复 |
+|---|------|------|
+| 15 | `BM25Retriever.from_documents` 在每次 `search()` 里重建索引（3 个 query = 3 次全量构建） | 只在 `rebuild()` 时构建一次，检索时 `model_copy(update={"k": ...})` 复用倒排结构 |
+| 16 | 每次调温就新建一个 OpenAI client（评分场景每篇文档一个） | 按 `(temperature, max_tokens)` 复用 `model_copy` 变体，共享连接池 |
+| 17 | 改写 + Multi-Query 两次串行 LLM 往返 | 合并为一次结构化调用（`QueryPlan`），失败再退化到纯文本解析 |
+| 18 | 复杂 PDF“有图就整页 2× 渲染 + OCR”，且与已提取文本重复入库 | 仅当页面可提取文本低于 `OCR_TEXT_THRESHOLD` 才 OCR，并剔除重复行；表格用 bbox 从正文中裁掉，不会一份内容出现三次 |
+| 19 | 无任何超时，上游卡死会占满线程池 | `thread_pool.run_sync(..., timeout=)`、请求级 `REQUEST_TIMEOUT`、LLM `timeout/max_retries` |
+
+### 2.4 工程 / 部署 / 安全
+
+- **HTTP 语义**：所有错误走异常处理器，HTTP 状态码与 `code` 字段一致（旧版一律 200）；
+  500 不再把内部异常文本回显给客户端。
+- **参数校验**：请求模型补齐 `min_length/ge/le`，并注册 `RequestValidationError` 处理器（422）。
+- **响应模型**：全部接口有 `response_model`，`/docs` 出现真实 schema。
+- **上传**：边读边校验大小（不再整包读进内存）；扩展名白名单；`overlap >= chunk_size` 直接拒绝。
+- **鉴权**：新增可选 `API_AUTH_TOKEN`（写操作校验 `X-API-Token`，WS 用 `?token=`）。
+- **CORS**：`*` 与 `credentials` 不再同时开启（浏览器规范要求）。
+- **WebSocket**：进度推送改为「队列 + `call_soon_threadsafe`」，不再从工作线程裸调 `create_task`；
+  删掉只能提示“请用 HTTP 上传”的空壳 WS 接口。
+- **依赖**：`pyproject.toml` 与 `requirements.txt` 对齐（补 `python-multipart`、`websockets`、`python-dotenv` 等；
+  RAGAS 移出运行依赖；`paddleocr` 锁 `<3`）；解析器全部**延迟导入**，没装 OCR 也能启动。
+- **PaddleOCR 3.x 兼容层**：`app/parsers/ocr_engine.py` 统一 2.x/3.x 的构造参数与返回结构差异。
+- **日志**：`RotatingFileHandler` + 目录不可写时降级为仅控制台（不再因日志目录权限导致服务起不来）。
+- **Docker**：新增 `.dockerignore`（避免把 `.venv` 打进构建上下文）、非 root 运行、健康检查改用 `/health/ready`、
+  compose 补 `DEEPSEEK_*` / `LANGSMITH_*` / `host.docker.internal`、模型缓存卷。
+- **部署文档**：补 `.env.example`（README 一直在让你 `cp .env.example .env`，但文件不存在）。
+
+### 2.5 测试与评估
+
+- 新增 **44 个单元测试**（分割器、去重 key、加权 RRF、缓存失效、CRAG 决策/批量评分、配置校验、API 状态码与安全）。
+- 新增 **5 个 Milvus 集成测试**（真实读写，含完整 E2E：上传 → 检索 → 问答 → 删除 → 缓存失效）。
+  `pytest` 默认跳过 `integration`，`pytest -m integration` 单独运行。
+- RAGAS 脚本重写：接上 DeepSeek + DashScope（旧版默认要 `OPENAI_API_KEY`，从未跑通）、
+  用 `to_pandas()` 取指标（旧版读 `_scores` 得到空报告）、支持 `--ingest` 灌语料、
+  支持 `--variants` 跑**消融对比**（纯向量 / 混合 / +重排 / 全量）。
+
+---
+
+## 3. 架构
 
 ```
-START
-  → query_rewrite   (Query 改写/扩展)
-  → retrieve        (混合检索：向量 + BM25 + RRF 融合)
-  → grade           (CRAG 文档相关性评分)
-  → ┌─ 全部无关且未达上限 → increment_iteration → 回到 query_rewrite
-    └─ 相关 → rerank (Cross-Encoder 重排序)
-  → generate        (生成答案 + 引用来源)
-  → END
+                 ┌──────────────── 检索子图（被两条入口共用）────────────────┐
+START → retrieval │ query_rewrite → retrieve → grade ──┬→ increment_iteration ─┐
+                 │                                     │        （回到改写）     │
+                 │                                     └→ rerank → END          │
+                 └─────────────────────────────────────────────────────────────┘
+                                        ↓
+                                    generate → END
 ```
 
-## 项目结构
+- `GET  /api/v1/health`       轻量存活检查（无外部调用，但状态真实计算）
+- `GET  /api/v1/health/ready` 就绪检查（ping Milvus + schema 校验，未就绪 503）
+- 流式接口只复用「检索子图」，生成阶段走 LLM token 流，**不重复实现检索逻辑**
+
+### 目录结构
 
 ```
 app/
-├── main.py                   # FastAPI 入口
-├── config.py                 # 配置管理（pydantic-settings）
-├── api/v1/                   # API 接口层
-├── core/                     # LangChain 组件层
-│   ├── embeddings.py         # DashScopeEmbeddings 封装
-│   ├── llm.py                # ChatDashScope 封装
-│   ├── vector_store.py       # Milvus VectorStore 封装
-│   ├── bm25_retriever.py     # BM25 检索器（LangChain）
-│   ├── reranker.py           # Cross-Encoder 重排序
-│   ├── query_processor.py    # Query 改写/扩展/HyDE（新增）
-│   ├── cache.py              # 缓存（新增）
-│   ├── langsmith.py          # LangSmith 可观测性（新增）
-│   └── ...
-├── graph/                    # LangGraph 状态机（新增）
-│   ├── state.py              # RAGState 定义
-│   ├── nodes.py              # 节点函数
-│   └── graph.py              # 状态机组装
-├── services/                 # 业务服务层
-│   ├── chat_service.py       # 问答服务（调用 LangGraph）
-│   ├── document_service.py   # 文档处理服务
-│   └── session_service.py    # 会话管理
-├── parsers/                  # 文档解析层（保留）
-├── models/                   # 数据模型
-└── utils/                    # 工具（切分、日志）
+├── main.py                 # FastAPI 入口（lifespan / CORS / 异常处理器 / 启动自愈）
+├── config.py               # pydantic-settings 配置 + 组合校验
+├── api/
+│   ├── deps.py             # 可选令牌鉴权
+│   └── v1/{chat,documents,health,router}.py
+├── core/
+│   ├── llm.py              # DeepSeek 客户端（复用 + 结构化输出）
+│   ├── embeddings.py       # DashScope Embedding（懒加载 + 缓存）
+│   ├── vector_store.py     # Milvus（动态字段 / 真删除 / 全量遍历 / schema 兼容检查）
+│   ├── bm25_retriever.py   # BM25（构建一次，复用）
+│   ├── reranker.py         # Cross-Encoder（device 可配 + 失败降级）
+│   ├── query_processor.py  # 一次调用完成改写 + 多查询扩展
+│   ├── documents.py        # Document 副本 / 去重 key / 正文取值
+│   ├── cache.py            # Embedding LRU + 查询 TTL（可失效）
+│   ├── exceptions.py       # 业务异常 + 全局处理器
+│   └── thread_pool.py      # 带超时的线程池
+├── graph/                  # state / nodes / graph（检索子图 + 完整图）
+├── services/               # chat / document / session
+├── parsers/                # pdf / ocr(2.x+3.x 兼容) / word(含表格) / unstructured(含页码)
+├── models/                 # 请求/响应模型（带校验）
+└── utils/                  # 分割器（chunk_id 全局唯一）/ 日志
 tests/
-└── evaluation/               # RAGAS 评估（新增）
-    ├── eval_dataset.json
-    └── run_ragas_eval.py
+├── unit/                   # 44 个单测
+├── api/                    # 接口层测试
+├── integration/            # 真实 Milvus 集成测试（含 E2E）
+└── evaluation/             # RAGAS 消融评估
 ```
 
-## 快速开始
+---
 
-### 1. 安装依赖
-
-```bash
-pip install -r requirements.txt
-# 或安装 RAGAS 评估依赖
-pip install -e ".[dev,evaluation]"
-```
-
-### 2. 配置环境变量
+## 4. 快速开始
 
 ```bash
-cp .env.example .env
-# 编辑 .env，填入 DASHSCOPE_API_KEY 等配置
-```
+# 1. 依赖（Python >= 3.11）
+python -m venv .venv && .venv\Scripts\activate      # Windows
+pip install -r requirements.txt                     # 含文档解析能力
+# 或者只要问答能力：pip install -e ".[dev]"
 
-### 3. 启动服务
+# 2. 配置
+cp .env.example .env    # 填入 DEEPSEEK_API_KEY / DASHSCOPE_API_KEY / MILVUS_*
 
-```bash
+# 3. 启动
 python -m app.main
-# 或
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+# 或：uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-### 4. 访问
-
-- API 文档：http://localhost:8000/docs
 - 前端页面：http://localhost:8000/
-- 健康检查：http://localhost:8000/api/v1/health
+- 接口文档：http://localhost:8000/docs
+- 健康检查：http://localhost:8000/api/v1/health ｜ 就绪：`/api/v1/health/ready`
 
-## 运行评估
+### Milvus 集合说明（重要）
 
-```bash
-python -m tests.evaluation.run_ragas_eval
-```
+- 应用会在首次写入时创建集合，字段：`id`(VARCHAR 主键)、`content`(参与向量化的文本)、
+  `embedding`(FLOAT_VECTOR)、以及 metadata 动态字段（`raw_content / title / document_id /
+  document_name / file_type / page_num / chunk_id`）。
+- 若 `MILVUS_COLLECTION` 指向了**其它项目遗留的集合**，启动时会打印明确的 `schema 不兼容` 错误，
+  `/api/v1/documents/list` 仍可读，但上传会被拒绝并提示修复方式。推荐：给本项目一个专用集合名。
+- `MILVUS_DROP_OLD=true` 会在启动时删除同名集合重建（**会丢数据**，仅在确认可弃时使用）。
 
-评估指标：
-- **faithfulness**（忠实度）：答案是否基于检索内容
-- **answer_relevancy**（答案相关性）：答案是否回答了对的问题
-- **context_precision**（上下文精确率）：检索内容是否相关
-- **context_recall**（上下文召回率）：需要的检索内容是否都检索到
+---
 
-## 启用 LangSmith 追踪
+## 5. 关键配置
 
-在 `.env` 中配置：
-
-```bash
-LANGCHAIN_TRACING_V2=true
-LANGCHAIN_API_KEY=ls__xxxxxxxxxxxx
-LANGCHAIN_PROJECT=rag-langgraph-v2
-```
-
-启动后，LangChain/LangGraph 的所有调用会自动上报到 LangSmith 控制台。
-
-## 主要 API
-
-| 接口 | 方法 | 说明 |
+| 变量 | 默认 | 说明 |
 |------|------|------|
-| `/api/v1/documents/upload` | POST | 上传文档 |
-| `/api/v1/documents/list` | GET | 文档列表 |
-| `/api/v1/documents/{id}` | DELETE | 删除文档 |
-| `/api/v1/chat/query` | POST | 智能问答 |
-| `/api/v1/chat/stream` | POST | 流式问答（SSE） |
-| `/api/v1/health` | GET | 健康检查 |
+| `ALLOW_LLM_FALLBACK` | `false` | 检索不到内容时是否允许脱离知识库作答；false = 直接拒答 |
+| `VECTOR_WEIGHT` / `BM25_WEIGHT` | `1.0` / `1.0` | 加权 RRF 的通道权重 |
+| `RETRIEVAL_CANDIDATE_K` | `20` | 召回候选数；CRAG 重试时自动放宽 |
+| `CRAG_MAX_ITERATIONS` | `2` | 最大重检索轮数 |
+| `CRAG_MAX_GRADE_DOCS` | `20` | 单次批量评分的文档数上限 |
+| `CRAG_MIN_RELEVANT` | `1` | 至少命中几篇才算“相关” |
+| `RERANKER_DEVICE` | `cpu` | `cpu` / `cuda` / `cuda:0` / `mps` / `auto` |
+| `RERANK_MIN_SCORE` | `0` | 低于该分数直接丢弃（>0 才生效） |
+| `QUERY_REWRITE_ENABLED` / `MULTI_QUERY_ENABLED` | `true` | 关闭后检索 query 不再改写，CRAG 也不会重试 |
+| `CONTEXT_MAX_CHARS` | `12000` | 拼进 prompt 的上下文字符上限 |
+| `REQUEST_TIMEOUT` | `120` | 单次问答总超时（秒） |
+| `API_AUTH_TOKEN` | 空 | 非空时写操作需要 `X-API-Token` |
+| `CORS_ORIGINS` | `*` | 逗号分隔；为 `*` 时自动关闭 credentials |
+| `OCR_TEXT_THRESHOLD` | `200` | 页面可提取文本低于该长度才整页 OCR |
+
+完整列表见 `.env.example`。
+
+---
+
+## 6. API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v1/documents/upload` | 上传单个文档（multipart） |
+| POST | `/api/v1/documents/upload/batch` | 批量上传（最后统一重建一次索引） |
+| GET | `/api/v1/documents/list` | 文档列表（按 document_id 聚合） |
+| DELETE | `/api/v1/documents/{document_id}` | 删除文档（向量库 + 内存索引 + 缓存） |
+| POST | `/api/v1/chat/query` | 问答 |
+| POST | `/api/v1/chat/stream` | 流式问答（SSE） |
+| WS | `/api/v1/chat/query/logs` | 处理进度推送（可选） |
+| POST | `/api/v1/chat/session/clear` | 清空会话 |
+| GET | `/api/v1/health` | 存活检查 |
+| GET | `/api/v1/health/ready` | 就绪检查（503 表示未就绪） |
+| GET | `/api/v1/stats` | 缓存命中率 / BM25 文档数 / 会话数 |
+
+响应统一为 `{"code", "message", "error", "data"}`，**HTTP 状态码与 `code` 一致**。
+
+问答响应里额外给出：
+
+```json
+{
+  "used_fallback": false,   // true = 本次回答没有知识库依据
+  "degraded": false,        // true = 发生了降级（BM25 空 / 评分失败等）
+  "notes": [],              // 降级原因与策略说明
+  "crag_iterations": 0,
+  "cached": false
+}
+```
+
+---
+
+## 7. 测试
+
+```bash
+pip install -e ".[dev]"
+
+pytest                     # 单元 + 接口测试（默认跳过 integration）
+pytest -m integration      # 需要可用的 Milvus，会真实建/删测试集合
+```
+
+- 单元测试不访问网络：`conftest.py` 用假 Key，任何真实外部调用都会立即失败。
+- 集成测试使用**确定性假 Embedding + 假 LLM**，只依赖真实 Milvus，不消耗模型配额。
+
+---
+
+## 8. 评估（RAGAS 消融）
+
+```bash
+pip install -e ".[evaluation]"
+
+# 先把语料灌进知识库，再跑全部变体的对比
+python -m tests.evaluation.run_ragas_eval --ingest --corpus ./docs
+
+# 只跑某一个变体
+python -m tests.evaluation.run_ragas_eval --variants hybrid_rerank
+```
+
+输出对比表（faithfulness / answer_relevancy / context_precision / context_recall）并写入
+`tests/evaluation/eval_report.json`。变体：`vector_only` / `hybrid` / `hybrid_rerank` / `full`。
+
+> 只有这张表能证明“混合检索/重排/CRAG 到底有没有用”。建议在 README 里贴一次结果。
+
+---
+
+## 9. 部署
+
+```bash
+cp .env.example .env      # 填好密钥
+docker compose -f docker/docker-compose.yml up -d --build
+
+# 需要本地起 Milvus 时
+docker compose -f docker/docker-compose.yml --profile milvus up -d
+```
+
+**单 worker 运行**：BM25 索引与会话都存在进程内。多 worker / 多副本需要：
+- BM25 → 换成 Milvus 的 `BM25BuiltInFunction` 稀疏检索，或独立 ES；
+- 会话 → Redis；
+- 查询缓存 → Redis（且按知识库版本失效）。
+
+---
+
+## 10. 已知限制（有意保留，写在这里而不是藏着）
+
+1. BM25 索引在进程内存中：启动时重建（可接受），但多副本会各建一份。
+2. 会话存储为进程内 dict：重启即丢，`SESSION_MAX_COUNT` 防内存无限增长。
+3. 文档解析不支持扫描版 PDF 的版面还原（表格是 Markdown 近似）。
+4. `.doc` 老格式依赖 antiword / textract / Word COM 之一，缺失时给出明确提示。
+5. 重排模型首次启动会下载（约 300MB），建议挂载 HF 缓存目录。
+6. 没有内置限流/配额：`API_AUTH_TOKEN` 只是最简鉴权，公网部署请放在网关后面。
+
+## 11. 排错
+
+| 现象 | 原因与处理 |
+|------|-----------|
+| 启动报 `TypeError: lifespan() takes 0 positional arguments` | v2.0 的 bug，v2.1 已修复；确认拉到的代码是 2.1.0 |
+| 上传返回 `Embedding 调用失败: 401 InvalidApiKey` | `DASHSCOPE_API_KEY` 无效或过期，去百炼控制台重新生成 |
+| 上传返回 `schema 不兼容` | `MILVUS_COLLECTION` 指向了其它项目的集合，换一个专用集合名（或 `MILVUS_DROP_OLD=true` 重建） |
+| `/health/ready` 返回 503 | 看响应里的 `milvus.status / schema / llm_configured`；`row_count` 需要 flush 才准确，正常现象 |
+| 问答一直 `used_fallback=true` | 知识库为空或检索不到；先 `/documents/list` 确认数据，再看 `notes` |
+| `paddleocr` 报参数错误 | v3 改了 API，已用 `app/parsers/ocr_engine.py` 兼容；若仍失败请锁 `paddleocr<3` |
+
+## License
+
+MIT

@@ -1,489 +1,242 @@
 """
-文本分割工具（优化版：支持递归字符分割和章节分割）
+文本分割工具
+
+本次修复：
+1. **chunk_id 全局唯一**：旧实现每页调用 ``split_text`` 都从 0 开始编号，
+   而文档去重 key 用的是 ``document_id + chunk_id``，于是不同页的 chunk 撞号，
+   RRF 融合时会把不同内容当成同一篇。现在由调用方传入 ``start_chunk_id`` 连续编号。
+2. **递归分割交给 LangChain**：删掉手写的 RecursiveCharacterTextSplitter（其中
+   ``range(0, n, chunk_size - overlap)`` 在 overlap>=chunk_size 时会踩零步长死循环），
+   直接复用经过充分测试的 ``langchain_text_splitters.RecursiveCharacterTextSplitter``。
+3. 标题识别收紧：只有真正的标题（Markdown / 编号标题 / 短行）才参与“标题重复两次”
+   的权重增强，避免把正文首句复制进向量文本制造噪声。
 """
-from typing import List, Optional
-from dataclasses import dataclass
+from __future__ import annotations
+
 import re
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter as LangChainRecursiveSplitter
 
 from app.config import settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+DEFAULT_SEPARATORS = [
+    "\n\n",   # 段落
+    "\n",     # 换行
+    "。", "！", "？", "；",
+    ". ", "! ", "? ", "; ",
+    "，", ", ",
+    " ",
+    "",
+]
+
 
 @dataclass
 class TextChunk:
-    """文本块（优化后：支持标题提取）"""
-    title: str          # 标题
-    content: str        # 正文内容
+    """文本块"""
+
+    title: str
+    content: str
     chunk_id: int
     page_num: int = 0
 
 
-class RecursiveCharacterTextSplitter:
-    """
-    递归字符文本分割器
-    按照分隔符优先级递归分割文本，保持语义完整性
-    """
-    
-    def __init__(
-        self,
-        chunk_size: int = 500,
-        chunk_overlap: int = 50,
-        separators: Optional[List[str]] = None,
-        keep_separator: bool = True
-    ):
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
-        self.keep_separator = keep_separator
-        
-        # 默认分隔符优先级（从大到小）
-        # 优先按段落、句子分割，最后才按字符分割
-        if separators is None:
-            self.separators = [
-                "\n\n",      # 段落分隔（优先级最高）
-                "\n",        # 换行
-                "。",        # 中文句号
-                "！",        # 中文感叹号
-                "？",        # 中文问号
-                "；",        # 中文分号
-                ".",         # 英文句号
-                "!",         # 英文感叹号
-                "?",         # 英文问号
-                ";",         # 英文分号
-                "，",        # 中文逗号
-                ",",         # 英文逗号
-                " ",         # 空格
-                ""           # 字符级别（最后手段）
-            ]
-        else:
-            self.separators = separators
-    
-    def _split_text_with_separator(self, text: str, separator: str) -> List[str]:
-        """使用指定分隔符分割文本"""
-        if separator:
-            if self.keep_separator:
-                # 保留分隔符在分割结果中
-                splits = text.split(separator)
-                return [s + separator for s in splits[:-1]] + [splits[-1]]
-            else:
-                return text.split(separator)
-        else:
-            # 按字符分割
-            return list(text)
-    
-    def _merge_splits(self, splits: List[str], separator: str) -> List[str]:
-        """合并分割片段，确保每个块不超过chunk_size，优先保持句子完整性"""
-        merged_chunks = []
-        current_chunk = []
-        current_length = 0
-        
-        for split in splits:
-            split_length = len(split)
-            
-            # 如果单个split就超过chunk_size，需要进一步分割
-            if split_length > self.chunk_size:
-                # 先保存当前chunk
-                if current_chunk:
-                    merged_chunks.append(''.join(current_chunk))
-                    current_chunk = []
-                    current_length = 0
-                
-                # 递归分割这个过大的split
-                if separator:
-                    # 找到下一个优先级的分隔符
-                    try:
-                        next_sep_index = self.separators.index(separator) + 1
-                        if next_sep_index < len(self.separators):
-                            next_separator = self.separators[next_sep_index]
-                        else:
-                            next_separator = ""
-                    except ValueError:
-                        next_separator = ""
-                    
-                    # 递归分割
-                    sub_chunks = self._split_text_recursive(split, next_separator)
-                    merged_chunks.extend(sub_chunks)
-                else:
-                    # 已经是字符级别，强制分割
-                    for i in range(0, split_length, self.chunk_size - self.chunk_overlap):
-                        merged_chunks.append(split[i:i + self.chunk_size])
-                continue
-            
-            # 检查是否需要开始新的chunk
-            if current_length + split_length > self.chunk_size and current_chunk:
-                # 优先保持句子完整性：如果当前split是句子结尾，将其加入当前chunk
-                is_sentence_end = any(split.endswith(punct) for punct in ["。", "！", "？", ".", "!", "?"])
-                
-                if is_sentence_end:
-                    # 允许稍微超过chunk_size以保持句子完整
-                    if current_length + split_length <= self.chunk_size * 1.2:  # 20% 容差
-                        current_chunk.append(split)
-                        current_length += split_length
-                        merged_chunks.append(''.join(current_chunk))
-                    else:
-                        # 即使是句子结尾也超过太多，需要分割
-                        merged_chunks.append(''.join(current_chunk))
-                else:
-                    # 不是句子结尾，正常分割
-                    merged_chunks.append(''.join(current_chunk))
-                
-                # 处理重叠：保留最后几个split作为重叠
-                overlap_chunks = []
-                overlap_length = 0
-                for s in reversed(current_chunk):
-                    if overlap_length + len(s) <= self.chunk_overlap:
-                        overlap_chunks.insert(0, s)
-                        overlap_length += len(s)
-                    else:
-                        break
-                
-                current_chunk = overlap_chunks
-                current_length = overlap_length
-            
-            current_chunk.append(split)
-            current_length += split_length
-        
-        # 保存最后一个chunk
-        if current_chunk:
-            merged_chunks.append(''.join(current_chunk))
-        
-        return merged_chunks
-    
-    def _split_text_recursive(self, text: str, separator: str) -> List[str]:
-        """递归分割文本"""
-        if len(text) <= self.chunk_size:
-            return [text] if text.strip() else []
-        
-        # 使用当前分隔符分割
-        splits = self._split_text_with_separator(text, separator)
-        
-        # 过滤空字符串
-        splits = [s for s in splits if s.strip()]
-        
-        if not splits:
-            return []
-        
-        # 检查是否所有split都小于chunk_size
-        if all(len(s) <= self.chunk_size for s in splits):
-            # 合并相邻的split
-            return self._merge_splits(splits, separator)
-        
-        # 如果还有过大的split，使用下一个分隔符递归分割
-        try:
-            next_sep_index = self.separators.index(separator) + 1
-            if next_sep_index < len(self.separators):
-                next_separator = self.separators[next_sep_index]
-            else:
-                next_separator = ""
-        except ValueError:
-            next_separator = ""
-        
-        # 递归处理每个split
-        result = []
-        for split in splits:
-            if len(split) <= self.chunk_size:
-                result.append(split)
-            else:
-                result.extend(self._split_text_recursive(split, next_separator))
-        
-        # 最后合并一次
-        return self._merge_splits(result, separator)
-    
-    def split_text(self, text: str) -> List[str]:
-        """分割文本"""
-        if not text or not text.strip():
-            return []
-        
-        # 从第一个分隔符开始递归分割
-        return self._split_text_recursive(text, self.separators[0])
-
-
 class ChapterTextSplitter:
-    """
-    章节文本分割器
-    识别文档中的章节结构，按章节分割
-    """
-    
-    # 章节标题的正则模式
+    """按章节标题切分（识别不到章节时返回整段）"""
+
     CHAPTER_PATTERNS = [
-        r'^第[一二三四五六七八九十百千万零\d]+[章节篇部]\s*.+',  # 第一章、第1节等
-        r'^[一二三四五六七八九十百千万]+[、.．]\s*.+',  # 一、二、等
-        r'^\d+[、.．]\s*.+',  # 1、2、等
-        r'^#+\s+.+',  # Markdown标题
-        r'^[A-Z][、.．]\s*.+',  # A、B、等
-        r'^\([一二三四五六七八九十\d]+\)\s*.+',  # （一）、（1）等
+        r"^第[一二三四五六七八九十百千万零\d]+[章节篇部]\s*.+",
+        r"^[一二三四五六七八九十百千万]+[、.．]\s*.+",
+        r"^\d+[、.．]\s*.+",
+        r"^#+\s+.+",
+        r"^[A-Z][、.．]\s*.+",
+        r"^[（(][一二三四五六七八九十\d]+[）)]\s*.+",
     ]
-    
-    def __init__(self, min_chunk_size: int = 100):
+
+    def __init__(self, min_chunk_size: int = 100) -> None:
         self.min_chunk_size = min_chunk_size
         self.chapter_patterns = [re.compile(p, re.MULTILINE) for p in self.CHAPTER_PATTERNS]
-    
-    def _find_chapters(self, text: str) -> List[tuple]:
-        """查找文档中的章节位置"""
-        chapters = []
-        
+
+    def _find_chapters(self, text: str) -> List[Tuple[int, str]]:
+        chapters: List[Tuple[int, str]] = []
         for pattern in self.chapter_patterns:
-            matches = list(pattern.finditer(text))
-            if matches:
-                for match in matches:
-                    chapters.append((match.start(), match.group().strip()))
-        
-        # 按位置排序
-        chapters.sort(key=lambda x: x[0])
-        
-        # 去重（如果多个模式匹配到同一位置）
-        unique_chapters = []
+            for match in pattern.finditer(text):
+                chapters.append((match.start(), match.group().strip()))
+        chapters.sort(key=lambda item: item[0])
+
+        unique: List[Tuple[int, str]] = []
         last_pos = -1
         for pos, title in chapters:
-            if pos > last_pos + 10:  # 至少间隔10个字符
-                unique_chapters.append((pos, title))
+            # 注意：不能写成 pos > last_pos + 10 —— last_pos 初值为 -1，
+            # 会让“位于正文开头（pos=0）的章节标题”被判为重复而丢弃。
+            if last_pos < 0 or pos > last_pos + 10:
+                unique.append((pos, title))
                 last_pos = pos
-        
-        return unique_chapters
-    
-    def split_text(self, text: str) -> List[tuple]:
-        """
-        按章节分割文本
-        
-        Returns:
-            List of (title, content) tuples
-        """
+        return unique
+
+    def split_text(self, text: str) -> List[Tuple[str, str]]:
         if not text or not text.strip():
             return []
-        
+
         chapters = self._find_chapters(text)
-        
         if not chapters:
-            # 没有找到章节，返回整个文本
             return [("", text)]
-        
-        result = []
+
+        result: List[Tuple[str, str]] = []
         for i, (pos, title) in enumerate(chapters):
-            # 章节内容从当前位置到下一个章节开始
-            if i + 1 < len(chapters):
-                content = text[pos:chapters[i+1][0]].strip()
-            else:
-                content = text[pos:].strip()
-            
-            # 移除标题行
-            lines = content.split('\n', 1)
-            if len(lines) > 1:
-                content = lines[1].strip()
-            else:
-                content = ""
-            
+            end = chapters[i + 1][0] if i + 1 < len(chapters) else len(text)
+            content = text[pos:end].strip()
+
+            lines = content.split("\n", 1)
+            content = lines[1].strip() if len(lines) > 1 else ""
             if content:
                 result.append((title, content))
-        
-        # 处理第一个章节之前的内容
+
         if chapters and chapters[0][0] > 0:
-            intro_content = text[:chapters[0][0]].strip()
-            if len(intro_content) >= self.min_chunk_size:
-                result.insert(0, ("引言", intro_content))
-        
+            intro = text[: chapters[0][0]].strip()
+            if len(intro) >= self.min_chunk_size:
+                result.insert(0, ("引言", intro))
         return result
 
 
 class TextSplitter:
-    """文本分割器（整合递归字符分割和章节分割）"""
+    """文本分割器（章节切分 + 递归字符切分）"""
 
     def __init__(
         self,
-        chunk_size: int = None,
-        chunk_overlap: int = None,
-        enable_chapter_split: bool = True
-    ):
+        chunk_size: Optional[int] = None,
+        chunk_overlap: Optional[int] = None,
+        enable_chapter_split: bool = True,
+    ) -> None:
         self.chunk_size = chunk_size or settings.CHUNK_SIZE
         self.chunk_overlap = chunk_overlap or settings.CHUNK_OVERLAP
-        self.enable_chapter_split = enable_chapter_split
-        
-        # 初始化递归字符分割器
-        self.recursive_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunk_size,
-            chunk_overlap=self.chunk_overlap
-        )
-        
-        # 初始化章节分割器
-        self.chapter_splitter = ChapterTextSplitter(
-            min_chunk_size=self.chunk_size // 2
-        )
+        # 防御：overlap 必须小于 chunk_size
+        if self.chunk_overlap >= self.chunk_size:
+            logger.warning(
+                "chunk_overlap(%s) >= chunk_size(%s)，已自动下调 overlap",
+                self.chunk_overlap,
+                self.chunk_size,
+            )
+            self.chunk_overlap = max(0, self.chunk_size // 10)
 
-    def _extract_title(self, text: str) -> tuple:
-        """
-        提取标题和正文
-        
-        Args:
-            text: 文本内容
-            
-        Returns:
-            (title, content) 元组
-        """
-        lines = text.strip().split('\n')
-        
+        self.enable_chapter_split = enable_chapter_split
+        self.recursive_splitter = LangChainRecursiveSplitter(
+            separators=DEFAULT_SEPARATORS,
+            keep_separator=True,
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+            length_function=len,
+        )
+        self.chapter_splitter = ChapterTextSplitter(min_chunk_size=max(50, self.chunk_size // 2))
+
+    # ---------- 标题识别 ----------
+    def _extract_title(self, text: str) -> Tuple[str, str]:
+        lines = text.strip().split("\n")
         if not lines:
-            return ("", "")
-        
-        # 尝试识别标题（通常在第一行或前几行）
+            return "", ""
+
         title = ""
         content_start = 0
-        
-        # 标题识别规则：
-        # 1. 第一行较短（<100字符）且不以标点结尾
-        # 2. 包含标题关键词（第、章、节等）
-        # 3. Markdown标题格式（#、##、###）
-        for i, line in enumerate(lines[:3]):  # 只检查前3行
-            line = line.strip()
+        for i, raw_line in enumerate(lines[:3]):
+            line = raw_line.strip()
             if not line:
                 continue
-            
-            # Markdown标题
-            if line.startswith('#'):
-                title = line.lstrip('#').strip()
+            if line.startswith("#"):
+                title = line.lstrip("#").strip()
                 content_start = i + 1
                 break
-            
-            # 中文标题特征
-            if len(line) < 100 and not line.endswith(('。', '！', '？', '；', '：', '.', '!', '?', ';', ':')):
-                if any(keyword in line for keyword in ['第', '章', '节', '部分', '一、', '二、', '三、', '1.', '2.', '3.']):
+            if len(line) < 80 and not line.endswith(("。", "！", "？", "；", "：", ".", "!", "?", ";", ":")):
+                if ChapterTextSplitter.CHAPTER_PATTERNS and any(
+                    re.match(p, line) for p in ChapterTextSplitter.CHAPTER_PATTERNS
+                ):
                     title = line
                     content_start = i + 1
                     break
-                # 如果第一行较短且没有标点，可能是标题
-                if i == 0 and len(line) < 50:
+                if i == 0 and len(line) < 40:
                     title = line
                     content_start = i + 1
                     break
-        
-        # 提取正文
-        content = '\n'.join(lines[content_start:]).strip()
-        
-        # 如果没有识别到标题，使用第一句话作为标题
-        if not title and content:
-            # 提取第一句话（最多50字符）
-            first_sentence = ""
-            for char in content[:100]:
-                first_sentence += char
-                if char in ['。', '！', '？', '.', '!', '?']:
-                    break
-            title = first_sentence[:50] if len(first_sentence) > 10 else content[:30]
-        
+
+        content = "\n".join(lines[content_start:]).strip()
         return title, content
 
-    def split_text(
-        self,
-        text: str,
-        page_num: int = 0
-    ) -> List[TextChunk]:
+    # ---------- 分割 ----------
+    def split_text(self, text: str, page_num: int = 0, start_chunk_id: int = 0) -> List[TextChunk]:
         """
-        分割文本（使用递归字符分割和章节分割）
+        分割单个页面的文本
 
         Args:
-            text: 待分割的文本
+            text: 文本
             page_num: 页码
-
-        Returns:
-            文本块列表
+            start_chunk_id: 起始 chunk 编号（跨页连续，保证全局唯一）
         """
         if not text or not text.strip():
             return []
 
-        # 提取标题和正文
         title, content = self._extract_title(text)
-        
         if not content:
             return []
 
-        chunks = []
-        chunk_id = 0
-        
-        # 尝试章节分割
+        chunks: List[TextChunk] = []
+        chunk_id = start_chunk_id
+
+        # 1) 章节切分（能识别到多个章节时）
         if self.enable_chapter_split:
             chapter_splits = self.chapter_splitter.split_text(content)
-            
-            # 如果成功识别到章节
             if len(chapter_splits) > 1:
-                logger.info(f"识别到 {len(chapter_splits)} 个章节，按章节分割")
-                
                 for chapter_title, chapter_content in chapter_splits:
-                    # 对每个章节内容使用递归字符分割
                     if len(chapter_content) > self.chunk_size:
-                        sub_chunks = self.recursive_splitter.split_text(chapter_content)
-                        
-                        for i, sub_chunk in enumerate(sub_chunks):
-                            chunk_title = chapter_title if i == 0 else f"{chapter_title} (续{i})"
-                            chunks.append(TextChunk(
-                                title=chunk_title,
-                                content=sub_chunk,
-                                chunk_id=chunk_id,
-                                page_num=page_num
-                            ))
+                        for sub in self.recursive_splitter.split_text(chapter_content):
+                            chunks.append(
+                                TextChunk(
+                                    title=chapter_title or title,
+                                    content=sub,
+                                    chunk_id=chunk_id,
+                                    page_num=page_num,
+                                )
+                            )
                             chunk_id += 1
                     else:
-                        # 章节内容较小，直接作为一个chunk
-                        chunks.append(TextChunk(
-                            title=chapter_title or title,
-                            content=chapter_content,
-                            chunk_id=chunk_id,
-                            page_num=page_num
-                        ))
+                        chunks.append(
+                            TextChunk(
+                                title=chapter_title or title,
+                                content=chapter_content,
+                                chunk_id=chunk_id,
+                                page_num=page_num,
+                            )
+                        )
                         chunk_id += 1
-                
-                logger.info(f"章节分割完成，生成 {len(chunks)} 个文本块")
+                logger.info("章节分割完成，生成 %s 个文本块", len(chunks))
                 return chunks
-        
-        # 如果没有章节或章节分割未启用，使用递归字符分割
-        if len(content) <= self.chunk_size:
-            return [TextChunk(title=title, content=content, chunk_id=0, page_num=page_num)]
-        
-        # 使用递归字符分割
-        text_chunks = self.recursive_splitter.split_text(content)
-        
-        for i, chunk_content in enumerate(text_chunks):
-            chunk_title = title if i == 0 else f"{title} (续{i})"
-            chunks.append(TextChunk(
-                title=chunk_title,
-                content=chunk_content,
-                chunk_id=chunk_id,
-                page_num=page_num
-            ))
+
+        # 2) 递归字符切分
+        for sub in self.recursive_splitter.split_text(content):
+            sub = sub.strip()
+            if not sub:
+                continue
+            chunks.append(
+                TextChunk(title=title, content=sub, chunk_id=chunk_id, page_num=page_num)
+            )
             chunk_id += 1
 
-        logger.info(f"递归字符分割完成，生成 {len(chunks)} 个文本块（标题: {title[:30]}...）")
+        logger.info("递归字符分割完成，生成 %s 个文本块（标题: %s）", len(chunks), title[:30])
         return chunks
 
     def split_texts(
-        self,
-        texts: List[str],
-        page_nums: List[int] = None
+        self, texts: List[str], page_nums: Optional[List[int]] = None
     ) -> List[TextChunk]:
-        """
-        分割多个文本
-
-        Args:
-            texts: 文本列表
-            page_nums: 页码列表
-
-        Returns:
-            文本块列表
-        """
-        all_chunks = []
-        chunk_id = 0
-
+        """分割多个页面，chunk_id 全局连续（推荐 document_service 使用本方法）"""
+        all_chunks: List[TextChunk] = []
         for i, text in enumerate(texts):
             page_num = page_nums[i] if page_nums and i < len(page_nums) else 0
-            text_chunks = self.split_text(text, page_num)
-
-            # 重新编号
-            for tc in text_chunks:
-                tc.chunk_id = chunk_id
-                chunk_id += 1
-
-            all_chunks.extend(text_chunks)
-
-        logger.info(f"总共生成 {len(all_chunks)} 个文本块")
+            page_chunks = self.split_text(text, page_num, start_chunk_id=len(all_chunks))
+            all_chunks.extend(page_chunks)
+        logger.info("共生成 %s 个文本块", len(all_chunks))
         return all_chunks
 
 
-# 全局分割器实例
 text_splitter = TextSplitter()

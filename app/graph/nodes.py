@@ -1,436 +1,501 @@
 """
-LangGraph RAG 节点定义（升级版核心）
-实现 Agentic RAG 的五个核心节点 + 条件路由：
+LangGraph RAG 节点
 
-1. query_rewrite_node    - Query 改写/扩展（P1 优化）
-2. retrieve_node         - 混合检索（向量 + BM25 + RRF 融合，多 query 并行）
-3. grade_documents_node  - CRAG 文档相关性评分（P1 优化）
-4. rerank_node           - Cross-Encoder 重排序
-5. generate_node         - 生成答案（带引用，Self-RAG 基础）
-
-条件路由：
-- decide_after_grade     - CRAG 决策：全部无关且未达迭代上限 → 重检索，否则 → 重排序
+本次修复的核心问题：
+1. **CRAG 重试不再空转**：重检索时会把上一轮的 query 作为“失败提示”回灌给改写器，
+   同时放宽候选数（candidate_k），因此第二轮真的会换一批文档；
+2. **CRAG 评分批量化**：从“每篇文档一次 LLM 调用”改为“一次调用判 N 篇”，
+   单问题 LLM 调用数从 20~60 次降到 2~3 次；
+3. **节点不修改入参**：统一返回局部状态更新，并只写入 Document 副本，
+   避免 BM25 索引里的对象被污染、并发请求互相串分数；
+4. **无依据时不再假装有依据**：检索不到内容时默认拒答，``used_fallback`` 显式暴露；
+5. **配置真正生效**：RRF 按 VECTOR_WEIGHT / BM25_WEIGHT 加权，top_k / temperature /
+   max_tokens 从请求状态读取。
 """
-from typing import List, Dict, Tuple, Any
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.core.documents import copy_document, doc_key, doc_name, doc_text, doc_title
+from app.core.exceptions import LLMException
+from app.core.llm import get_llm_service
+from app.core.query_processor import QueryProcessor, get_query_processor
+from app.core.vector_store import get_vector_store_service
+from app.core.bm25_retriever import get_bm25_service
+from app.core.reranker import get_reranker_service
 from app.graph.state import RAGState
-from app.core.llm import llm_service
-from app.core.query_processor import query_processor
-from app.core.vector_store import vector_store_service
-from app.core.bm25_retriever import bm25_retriever_service
-from app.core.reranker import reranker_service
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+NO_CONTEXT_ANSWER = (
+    "抱歉，知识库中没有检索到与该问题相关的内容。\n\n"
+    "建议：\n"
+    "1. 换一种问法或补充更具体的信息；\n"
+    "2. 确认相关文档已经上传到知识库；\n"
+    "3. 如果只想基于通用知识闲聊，可以让管理员开启 ALLOW_LLM_FALLBACK。"
+)
+
+MAX_SOURCE_TEXT = 800
+MAX_GRADE_EXCERPT = 600
+
 
 # ============================================================
-# 辅助函数
+# 辅助：RRF 融合（支持通道权重）
 # ============================================================
-
-def _doc_key(doc: Document) -> str:
-    """
-    生成文档唯一标识（用于去重）
-
-    Args:
-        doc: 文档
-
-    Returns:
-        唯一标识字符串
-    """
-    metadata = doc.metadata or {}
-    doc_id = metadata.get("document_id", "")
-    chunk_id = str(metadata.get("chunk_id", ""))
-    if doc_id and chunk_id:
-        return f"{doc_id}_{chunk_id}"
-    # 无标识时回退到内容哈希
-    return str(hash(doc.page_content))
-
-
-def _doc_text(doc: Document) -> str:
-    """
-    提取文档正文（优先 metadata 中的原始正文，否则用 page_content）
-
-    Args:
-        doc: 文档
-
-    Returns:
-        正文文本
-    """
-    metadata = doc.metadata or {}
-    return metadata.get("content") or doc.page_content or ""
-
-
 def _rrf_fusion(
-    ranked_lists: List[List[Document]],
+    ranked_lists: Sequence[Tuple[str, List[Document]]],
     top_k: int,
-    k: int = 60
+    weights: Dict[str, float],
+    k: int = 60,
 ) -> List[Document]:
     """
-    RRF（Reciprocal Rank Fusion）融合多路检索结果
+    Reciprocal Rank Fusion
 
     Args:
-        ranked_lists: 多个已排序的文档列表（每路检索结果）
-        top_k: 返回文档数量
-        k: RRF 参数
-
-    Returns:
-        融合后的文档列表
+        ranked_lists: [(通道名, 已排序文档列表)]
+        top_k: 返回数量
+        weights: 通道权重（VECTOR_WEIGHT / BM25_WEIGHT）
+        k: RRF 平滑常数
     """
-    score_map: Dict[str, Tuple[Document, float]] = {}
+    score_map: Dict[str, List[Any]] = {}
 
-    for ranked_list in ranked_lists:
-        for rank, doc in enumerate(ranked_list):
-            key = _doc_key(doc)
-            rrf_score = 1.0 / (k + rank + 1)
-            if key not in score_map:
-                score_map[key] = (doc, rrf_score)
+    for channel, docs in ranked_lists:
+        weight = float(weights.get(channel, 1.0))
+        if weight <= 0:
+            continue
+        for rank, doc in enumerate(docs):
+            key = doc_key(doc)
+            contribution = weight / (k + rank + 1)
+            entry = score_map.get(key)
+            if entry is None:
+                copied = copy_document(doc)
+                copied.metadata["retrieval_channels"] = [channel]
+                score_map[key] = [copied, contribution]
             else:
-                # 同一文档出现在多路结果中，累加分数
-                existing_doc, existing_score = score_map[key]
-                score_map[key] = (existing_doc, existing_score + rrf_score)
+                entry[1] += contribution
+                channels = entry[0].metadata.setdefault("retrieval_channels", [])
+                if channel not in channels:
+                    channels.append(channel)
 
-    # 按融合分数降序
-    sorted_items = sorted(score_map.values(), key=lambda x: x[1], reverse=True)
+    ordered = sorted(score_map.values(), key=lambda item: item[1], reverse=True)
 
-    # 返回 top_k 文档，并把 RRF 分数写入 metadata
-    results = []
-    for doc, score in sorted_items[:top_k]:
-        doc.metadata["rrf_score"] = score
+    results: List[Document] = []
+    for doc, score in ordered[:top_k]:
+        doc.metadata["rrf_score"] = round(float(score), 6)
         results.append(doc)
-
     return results
 
 
 # ============================================================
-# 节点 1：Query 改写
+# 节点 1：Query 改写 / 扩展
 # ============================================================
-
-def query_rewrite_node(state: RAGState) -> RAGState:
-    """
-    Query 改写节点：结合历史做指代消解，并做 Multi-Query 扩展 / HyDE
-
-    Args:
-        state: 当前状态
-
-    Returns:
-        更新后的状态
-    """
+def query_rewrite_node(state: RAGState) -> Dict[str, Any]:
     question = state["question"]
-    history = state.get("history", [])
+    history = state.get("history") or []
+    iteration = int(state.get("iteration", 0) or 0)
+    notes = list(state.get("notes") or [])
 
-    logger.info(f"[query_rewrite] 开始处理问题: {question[:50]}")
+    retry_hint = ""
+    if iteration > 0:
+        retry_hint = QueryProcessor.build_retry_hint(list(state.get("queries") or []))
+        notes.append(f"CRAG 第 {iteration} 轮重检索：已回灌失败查询并放宽候选数")
 
-    # 生成检索 query 列表（含改写 + 扩展 + HyDE）
-    queries = query_processor.build_retrieval_queries(question, history)
+    processor = get_query_processor()
+    try:
+        queries = processor.build_retrieval_queries(question, history, retry_hint=retry_hint or None)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[query_rewrite] 规划失败，使用原问题: %s", exc)
+        queries = [question]
+        notes.append(f"Query 规划失败，降级为原问题：{exc}")
 
-    state["rewritten_query"] = queries[0]  # 第一个是改写后的主 query
-    state["queries"] = queries
+    # 重检索时逐轮放宽候选数（默认 20 → 30 → 40），避免反复捞同一批文档
+    base_k = settings.RETRIEVAL_CANDIDATE_K
+    candidate_k = base_k if iteration == 0 else min(base_k + base_k * iteration // 2, 200)
 
-    logger.info(f"[query_rewrite] 生成 {len(queries)} 个检索 query")
-    return state
+    logger.info(
+        "[query_rewrite] %s 个检索 query（iteration=%s, candidate_k=%s）",
+        len(queries),
+        iteration,
+        candidate_k,
+    )
+    return {
+        "rewritten_query": queries[0] if queries else question,
+        "queries": queries or [question],
+        "candidate_k": candidate_k,
+        "notes": notes,
+    }
 
 
 # ============================================================
 # 节点 2：混合检索
 # ============================================================
+def retrieve_node(state: RAGState) -> Dict[str, Any]:
+    queries = list(state.get("queries") or [state["question"]])
+    candidate_k = int(state.get("candidate_k") or settings.RETRIEVAL_CANDIDATE_K)
+    notes = list(state.get("notes") or [])
+    degraded = bool(state.get("degraded"))
 
-def retrieve_node(state: RAGState) -> RAGState:
-    """
-    混合检索节点：对每个 query 做向量 + BM25 双路召回，RRF 融合去重
+    vector_service = get_vector_store_service()
+    bm25_service = get_bm25_service()
+    bm25_ready = bm25_service.is_ready()
 
-    Args:
-        state: 当前状态
-
-    Returns:
-        更新后的状态
-    """
-    queries = state.get("queries", [state["question"]])
-    candidate_k = settings.RETRIEVAL_CANDIDATE_K
-
-    logger.info(f"[retrieve] 开始混合检索，共 {len(queries)} 个 query")
-
-    all_ranked_lists: List[List[Document]] = []
+    ranked: List[Tuple[str, List[Document]]] = []
+    vector_errors = 0
 
     for query in queries:
         try:
-            # 1. 向量检索
-            vector_results = vector_store_service.similarity_search_with_score(
-                query, k=candidate_k
-            )
-            vector_docs = [doc for doc, _ in vector_results]
-            all_ranked_lists.append(vector_docs)
-            logger.info(f"[retrieve] 向量检索 '{query[:30]}' 返回 {len(vector_docs)} 条")
+            vector_hits = [doc for doc, _ in vector_service.similarity_search_with_score(query, k=candidate_k)]
+            if vector_hits:
+                ranked.append(("vector", vector_hits))
+            logger.info("[retrieve] 向量召回 %s 条（query=%s）", len(vector_hits), query[:30])
+        except Exception as exc:  # noqa: BLE001
+            vector_errors += 1
+            logger.error("[retrieve] 向量检索异常: %s", exc)
 
-            # 2. BM25 检索
-            if bm25_retriever_service.count > 0:
-                bm25_docs = bm25_retriever_service.search(query, top_k=candidate_k)
-                all_ranked_lists.append(bm25_docs)
-                logger.info(f"[retrieve] BM25 检索 '{query[:30]}' 返回 {len(bm25_docs)} 条")
-        except Exception as e:
-            logger.error(f"[retrieve] 检索异常: {str(e)}")
+        if bm25_ready:
+            try:
+                bm25_hits = bm25_service.search(query, top_k=candidate_k)
+                if bm25_hits:
+                    ranked.append(("bm25", bm25_hits))
+                logger.info("[retrieve] BM25 召回 %s 条（query=%s）", len(bm25_hits), query[:30])
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[retrieve] BM25 检索异常: %s", exc)
 
-    # 3. RRF 融合去重
-    fused = _rrf_fusion(all_ranked_lists, top_k=candidate_k)
-    state["documents"] = fused
+    if not bm25_ready:
+        degraded = True
+        notes.append("BM25 索引为空：当前仅使用向量检索（知识库为空或索引尚未构建）")
 
-    logger.info(f"[retrieve] RRF 融合后得到 {len(fused)} 条候选文档")
-    return state
+    if vector_errors and vector_errors == len(queries):
+        degraded = True
+        notes.append("向量检索全部失败：请检查 Milvus 连接")
+
+    fused = _rrf_fusion(
+        ranked,
+        top_k=candidate_k,
+        weights={"vector": settings.VECTOR_WEIGHT, "bm25": settings.BM25_WEIGHT},
+        k=settings.RRF_K,
+    )
+    logger.info("[retrieve] RRF 融合后 %s 条候选（通道数=%s）", len(fused), len(ranked))
+
+    return {
+        "documents": fused,
+        "degraded": degraded,
+        "notes": notes,
+    }
 
 
 # ============================================================
-# 节点 3：CRAG 文档评分
+# 节点 3：CRAG 批量化相关性评分
 # ============================================================
+class _DocGrade(BaseModel):
+    index: int = Field(description="文档编号（从 1 开始）")
+    relevant: bool = Field(description="该文档能否用于回答用户问题")
 
-def _grade_single_document(question: str, doc_text: str) -> bool:
-    """
-    用 LLM 判断单篇文档与问题的相关性
 
-    Args:
-        question: 问题
-        doc_text: 文档正文
+class _GradeBatch(BaseModel):
+    grades: List[_DocGrade] = Field(description="每篇文档的相关性判断")
 
-    Returns:
-        是否相关
-    """
-    prompt = f"""你是一个文档相关性评估专家。请判断以下文档内容是否与用户问题相关，能否用于回答该问题。
 
-只回答 "yes" 或 "no"，不要输出任何其他内容。
+_GRADE_PROMPT = """你是检索结果相关性评估专家。判断下面的文档片段能否用于回答用户问题。
+
+判定标准：
+- 只要文档中包含了回答该问题所需的信息（哪怕只是部分信息），就算相关；
+- 仅仅出现相同的词但语义无关，算不相关；
+- 不要因为文档不完整而判为不相关。
 
 用户问题：{question}
 
-文档内容：
-{doc_text[:1000]}
+文档片段：
+{docs}
 
-相关（yes/no）："""
-
-    try:
-        answer = llm_service.chat(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-        ).strip().lower()
-        return answer.startswith("yes")
-    except Exception as e:
-        logger.warning(f"文档评分失败，默认为相关: {str(e)}")
-        return True
+请对每一篇文档给出 relevant=true/false。"""
 
 
-def grade_documents_node(state: RAGState) -> RAGState:
+def _format_grading_docs(docs: List[Document]) -> str:
+    blocks = []
+    for i, doc in enumerate(docs, start=1):
+        text = doc_text(doc)[:MAX_GRADE_EXCERPT].replace("\n", " ")
+        blocks.append(f"[{i}] {text}")
+    return "\n".join(blocks)
+
+
+def _grade_batch(question: str, docs: List[Document]) -> Optional[List[bool]]:
     """
-    CRAG 文档评分节点：用 LLM 评估每篇候选文档与问题的相关性
-
-    Args:
-        state: 当前状态
+    一次性判断多篇文档的相关性
 
     Returns:
-        更新后的状态
+        与 docs 等长的布尔列表；LLM 不可用时返回 None（调用方按“全相关”处理，宁可多留不可错杀）
     """
-    documents = state.get("documents", [])
-    question = state["rewritten_query"] or state["question"]
+    if not docs:
+        return []
 
-    # 未启用 CRAG 时跳过评分，全部视为相关
-    if not settings.CRAG_ENABLED:
-        state["graded_documents"] = documents
-        state["is_relevant"] = len(documents) > 0
-        return state
+    prompt = _GRADE_PROMPT.format(question=question, docs=_format_grading_docs(docs))
+    try:
+        grader = get_llm_service().structured(_GradeBatch, temperature=0.0, max_tokens=800)
+        result = grader.invoke([HumanMessage(content=prompt)])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[grade] 批量评分失败，按全部相关处理: %s", exc)
+        return None
+
+    if isinstance(result, dict):
+        try:
+            result = _GradeBatch(**result)
+        except Exception:  # noqa: BLE001
+            return None
+    if not isinstance(result, _GradeBatch):
+        return None
+
+    flags = [True] * len(docs)  # 未返回的文档默认保留（fail-open）
+    for item in result.grades:
+        index = item.index - 1
+        if 0 <= index < len(docs):
+            flags[index] = bool(item.relevant)
+    return flags
+
+
+def grade_documents_node(state: RAGState) -> Dict[str, Any]:
+    documents = list(state.get("documents") or [])
+    question = state.get("rewritten_query") or state["question"]
+    notes = list(state.get("notes") or [])
+    degraded = bool(state.get("degraded"))
 
     if not documents:
-        state["graded_documents"] = []
-        state["is_relevant"] = False
-        return state
+        return {"graded_documents": [], "is_relevant": False, "degraded": True,
+                "notes": notes + ["未检索到任何候选文档"]}
 
-    logger.info(f"[grade] CRAG 开始评分 {len(documents)} 篇文档")
+    if not settings.CRAG_ENABLED:
+        graded = [copy_document(doc) for doc in documents]
+        return {"graded_documents": graded, "is_relevant": bool(graded)}
 
-    graded = []
-    for doc in documents:
-        text = _doc_text(doc)
-        is_relevant = _grade_single_document(question, text)
-        if is_relevant:
-            doc.metadata["crag_relevant"] = True
-            graded.append(doc)
-        else:
-            doc.metadata["crag_relevant"] = False
+    # 只对前 N 篇做 LLM 评分（后面的文档本来也会被 rerank 截断）
+    to_grade = documents[: settings.CRAG_MAX_GRADE_DOCS]
+    logger.info("[grade] CRAG 批量评分 %s 篇文档（一次 LLM 调用）", len(to_grade))
 
-    state["graded_documents"] = graded
-    state["is_relevant"] = len(graded) > 0
+    flags = _grade_batch(question, to_grade)
+    if flags is None:
+        degraded = True
+        notes.append("CRAG 评分失败：已跳过过滤（保留全部候选）")
+        flags = [True] * len(to_grade)
 
-    logger.info(f"[grade] CRAG 评分完成：{len(graded)}/{len(documents)} 篇相关")
-    return state
+    graded: List[Document] = []
+    for doc, relevant in zip(to_grade, flags):
+        copied = copy_document(doc)
+        copied.metadata["crag_relevant"] = bool(relevant)
+        if relevant:
+            graded.append(copied)
+
+    is_relevant = len(graded) >= settings.CRAG_MIN_RELEVANT
+    logger.info("[grade] CRAG 评分完成：%s/%s 篇相关（is_relevant=%s）", len(graded), len(to_grade), is_relevant)
+
+    return {
+        "graded_documents": graded,
+        "is_relevant": is_relevant,
+        "degraded": degraded,
+        "notes": notes,
+    }
 
 
 # ============================================================
 # 条件路由：CRAG 决策
 # ============================================================
-
 def decide_after_grade(state: RAGState) -> str:
-    """
-    CRAG 决策函数：根据评分结果决定下一步
+    """全部无关且未达迭代上限 → 重检索；否则 → 重排"""
+    iteration = int(state.get("iteration", 0))
 
-    - 全部无关 且 未达迭代上限 → "rewrite_retrieve"（重检索）
-    - 否则 → "rerank"（重排序）
+    # CRAG 关闭时不重试
+    if not settings.CRAG_ENABLED:
+        return "rerank"
 
-    Args:
-        state: 当前状态
+    # 没有任何改写能力时，重检索只会拿到一模一样的 query，属于纯空转
+    can_rephrase = (
+        settings.QUERY_REWRITE_ENABLED or settings.MULTI_QUERY_ENABLED or settings.HYDE_ENABLED
+    )
+    if not can_rephrase:
+        if not state.get("is_relevant"):
+            logger.info("[route] 无改写能力，跳过重检索")
+        return "rerank"
 
-    Returns:
-        目标节点名称
-    """
-    if not state["is_relevant"] and state.get("iteration", 0) < settings.CRAG_MAX_ITERATIONS:
-        logger.info("[route] 检索结果全部无关，触发重检索")
+    if not state.get("is_relevant") and iteration < settings.CRAG_MAX_ITERATIONS:
+        logger.info("[route] 检索结果全部无关，触发第 %s 次重检索", iteration + 1)
         return "rewrite_retrieve"
-    logger.info("[route] 检索结果相关，进入重排序")
+    logger.info("[route] 进入重排序")
     return "rerank"
 
 
 # ============================================================
 # 节点 4：重排序
 # ============================================================
-
-def rerank_node(state: RAGState) -> RAGState:
-    """
-    重排序节点：用 Cross-Encoder 对相关文档重排序
-
-    Args:
-        state: 当前状态
-
-    Returns:
-        更新后的状态
-    """
-    documents = state.get("graded_documents", [])
-    question = state["rewritten_query"] or state["question"]
+def rerank_node(state: RAGState) -> Dict[str, Any]:
+    documents = list(state.get("graded_documents") or [])
+    question = state.get("rewritten_query") or state["question"]
+    top_k = int(state.get("top_k") or settings.RETRIEVAL_TOP_K)
+    notes = list(state.get("notes") or [])
 
     if not documents:
-        state["documents"] = []
-        return state
+        return {"documents": []}
 
-    # 未启用重排序时直接保留原顺序
     if not settings.RERANK_ENABLED:
-        state["documents"] = documents[:settings.RETRIEVAL_TOP_K]
-        return state
+        return {"documents": [copy_document(doc) for doc in documents[:top_k]]}
 
-    logger.info(f"[rerank] 开始重排序 {len(documents)} 篇文档")
+    logger.info("[rerank] 重排序 %s 篇文档", len(documents))
+    reranked = get_reranker_service().rerank(documents, question, top_n=top_k)
 
-    reranked = reranker_service.rerank(
-        documents, question, top_n=settings.RETRIEVAL_TOP_K
-    )
+    if settings.RERANK_MIN_SCORE > 0:
+        kept = [
+            doc
+            for doc in reranked
+            if float(doc.metadata.get("rerank_score", 0.0)) >= settings.RERANK_MIN_SCORE
+        ]
+        if len(kept) != len(reranked):
+            notes.append(
+                f"按 RERANK_MIN_SCORE={settings.RERANK_MIN_SCORE} 过滤掉 {len(reranked) - len(kept)} 篇弱相关文档"
+            )
+        reranked = kept
 
-    state["documents"] = reranked
-    logger.info(f"[rerank] 重排序完成，保留 {len(reranked)} 篇")
-    return state
+    logger.info("[rerank] 重排序完成，保留 %s 篇", len(reranked))
+    return {"documents": reranked, "notes": notes}
 
 
 # ============================================================
 # 节点 5：生成
 # ============================================================
+def _build_context(documents: List[Document]) -> str:
+    parts: List[str] = []
+    used = 0
+    for i, doc in enumerate(documents, start=1):
+        text = doc_text(doc)
+        title = doc_title(doc)
+        name = doc_name(doc)
+        header = f"【知识片段 {i}】（来源: {name}"
+        if title:
+            header += f"，标题: {title}"
+        page = doc.metadata.get("page_num")
+        if page:
+            header += f"，页码: {page}"
+        header += "）"
+        block = f"{header}\n{text}"
 
-def generate_node(state: RAGState) -> RAGState:
+        if used + len(block) > settings.CONTEXT_MAX_CHARS and parts:
+            break
+        parts.append(block)
+        used += len(block)
+    return "\n\n".join(parts)
+
+
+def _build_messages(question: str, history: List[Dict[str, str]], context: str) -> List[BaseMessage]:
+    if context:
+        system_prompt = f"""你是一个严谨的知识库问答助手。请严格依据下面的知识库内容回答用户问题。
+
+## 知识库内容
+{context}
+
+## 回答要求
+1. 只使用上述知识库内容，不要引入外部知识或臆造事实
+2. 引用信息时用【知识片段 n】标注来源
+3. 如果知识库内容不足以回答，直接说明"根据现有知识库无法准确回答"，不要猜测
+4. 回答简洁、条理清晰，涉及多轮对话时结合上下文
+5. 使用与用户问题相同的语言作答"""
+    else:
+        system_prompt = """你是一个知识库问答助手。当前知识库中没有检索到与问题相关的内容。
+
+## 回答要求
+1. 明确告知用户"知识库中没有找到相关内容"
+2. 不要编造事实
+3. 可以提示用户换一种问法或补充文档"""
+
+    messages: List[BaseMessage] = [SystemMessage(content=system_prompt)]
+    for msg in history or []:
+        role = (msg or {}).get("role", "user")
+        content = str((msg or {}).get("content", ""))
+        messages.append(AIMessage(content=content) if role == "assistant" else HumanMessage(content=content))
+    messages.append(HumanMessage(content=question))
+    return messages
+
+
+def build_generation_messages(
+    question: str,
+    history: List[Dict[str, str]],
+    documents: List[Document],
+) -> Tuple[List[BaseMessage], bool]:
     """
-    生成节点：基于检索内容生成答案，并附带引用来源
-
-    Args:
-        state: 当前状态
+    构造生成阶段的 messages（供 generate_node 与流式问答复用，保证两条路径提示词一致）
 
     Returns:
-        更新后的状态
+        (messages, has_context)
     """
+    context = _build_context(documents) if documents else ""
+    return _build_messages(question, history, context), bool(context)
+
+
+def generate_node(state: RAGState) -> Dict[str, Any]:
     question = state["question"]
-    history = state.get("history", [])
-    documents = state.get("documents", [])
+    history = list(state.get("history") or [])
+    documents = list(state.get("documents") or [])
+    notes = list(state.get("notes") or [])
+    degraded = bool(state.get("degraded"))
 
-    # 组装上下文
-    context_parts = []
-    for i, doc in enumerate(documents):
-        text = _doc_text(doc)
-        title = doc.metadata.get("title", "") if doc.metadata else ""
-        doc_name = doc.metadata.get("document_name", "未知文档") if doc.metadata else "未知文档"
-        prefix = f"【知识片段 {i + 1}】（来源: {doc_name}"
-        if title:
-            prefix += f"，标题: {title}"
-        prefix += f"）"
-        context_parts.append(f"{prefix}\n{text}")
+    # 无依据：默认拒答，避免“模型自由发挥被当成知识库答案”
+    if not documents and not settings.ALLOW_LLM_FALLBACK:
+        logger.info("[generate] 无检索结果且未开启 fallback，直接拒答")
+        return {
+            "answer": NO_CONTEXT_ANSWER,
+            "sources": [],
+            "used_fallback": True,
+            "degraded": True,
+            "notes": notes + ["知识库无相关依据，已按策略拒答"],
+        }
 
-    context_text = "\n\n".join(context_parts)
+    messages, has_context = build_generation_messages(question, history, documents)
 
-    # 构建系统提示
-    if context_text:
-        system_prompt = f"""你是一个智能问答助手。请根据以下知识库内容回答用户问题。
-
-## 知识库内容：
-{context_text}
-
-## 回答要求：
-1. 严格基于上述知识库内容回答用户问题
-2. 回答要简洁、准确、有条理
-3. 如果知识库内容与问题相关，综合运用相关知识回答
-4. 如果知识库内容不足以回答，请明确说明"根据现有知识库无法准确回答"
-5. 如果用户问题涉及之前的对话内容，请结合上下文回答"""
-        state["used_fallback"] = False
-    else:
-        system_prompt = """你是一个智能问答助手。知识库中没有检索到与问题相关的内容，请基于你的通用知识回答。
-
-## 回答要求：
-1. 回答要简洁、准确、有条理
-2. 如果涉及专业领域且不确定，请说明不确定性
-3. 如果用户问题涉及之前的对话内容，请结合上下文回答"""
-        state["used_fallback"] = True
-
-    # 组装消息
-    messages: List[Any] = [SystemMessage(content=system_prompt)]
-    for msg in history:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if role == "assistant":
-            from langchain_core.messages import AIMessage
-            messages.append(AIMessage(content=content))
-        else:
-            messages.append(HumanMessage(content=content))
-    messages.append(HumanMessage(content=question))
-
-    logger.info(f"[generate] 开始生成答案（{'带回知识库' if not state['used_fallback'] else '无上下文 fallback'}）")
-
+    logger.info("[generate] 生成答案（依据 %s 篇文档，fallback=%s）", len(documents), not has_context)
     try:
-        answer = llm_service.invoke_messages(messages)
-    except Exception as e:
-        logger.error(f"[generate] 生成失败: {str(e)}")
-        answer = f"抱歉，生成回答时出现错误: {str(e)}"
+        answer = get_llm_service().invoke_messages(
+            messages,
+            temperature=state.get("temperature"),
+            max_tokens=state.get("max_tokens"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        # 详细错误只写日志：上游 4xx/5xx 的原文可能包含账号、配额等内部信息
+        logger.error("[generate] 生成失败: %s", exc, exc_info=True)
+        raise LLMException("生成回答失败：模型调用异常，请稍后重试（详情见服务端日志）") from exc
 
-    state["answer"] = answer
-
-    # 格式化引用来源
     sources = []
     for doc in documents:
         metadata = doc.metadata or {}
-        sources.append({
-            "text": _doc_text(doc),
-            "score": metadata.get("rrf_score", metadata.get("score", 0)),
-            "document_name": metadata.get("document_name", "未知文档"),
-            "page_num": metadata.get("page_num", 0),
-            "title": metadata.get("title", ""),
-        })
-    state["sources"] = sources
+        sources.append(
+            {
+                "text": doc_text(doc)[:MAX_SOURCE_TEXT],
+                "score": metadata.get("rerank_score", metadata.get("rrf_score", 0.0)),
+                "rrf_score": metadata.get("rrf_score", 0.0),
+                "rerank_score": metadata.get("rerank_score"),
+                "document_id": metadata.get("document_id"),
+                "document_name": metadata.get("document_name", "未知文档"),
+                "page_num": metadata.get("page_num", 0),
+                "title": metadata.get("title", ""),
+                "chunk_id": metadata.get("chunk_id"),
+            }
+        )
 
-    logger.info(f"[generate] 生成完成，答案长度 {len(answer)} 字符，来源 {len(sources)} 条")
-    return state
+    logger.info("[generate] 完成，答案 %s 字符，来源 %s 条", len(answer), len(sources))
+    return {
+        "answer": answer,
+        "sources": sources,
+        "used_fallback": not has_context,
+        "degraded": degraded,
+        "notes": notes,
+    }
 
 
 # ============================================================
-# 重检索预处理：迭代计数递增（供条件边跳转回 query_rewrite 前使用）
+# CRAG 迭代计数
 # ============================================================
-
-def increment_iteration_node(state: RAGState) -> RAGState:
-    """
-    递增 CRAG 迭代计数（在重检索前调用）
-
-    Args:
-        state: 当前状态
-
-    Returns:
-        更新后的状态
-    """
-    state["iteration"] = state.get("iteration", 0) + 1
-    logger.info(f"[crag] 开始第 {state['iteration']} 次重检索")
-    return state
+def increment_iteration_node(state: RAGState) -> Dict[str, Any]:
+    iteration = int(state.get("iteration", 0) or 0) + 1
+    logger.info("[crag] 开始第 %s 次重检索", iteration)
+    return {"iteration": iteration}

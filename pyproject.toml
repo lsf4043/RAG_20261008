@@ -1,50 +1,66 @@
 [project]
 name = "rag-langgraph-v2"
-version = "2.0.0"
+version = "2.1.0"
 description = "基于 LangChain + LangGraph 的 Agentic RAG 智能问答系统"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
 authors = [
     {name = "RAG_LangGraph", email = "ai@example.com"}
 ]
-readme = "README.md"
-requires-python = ">=3.10"
-license = {text = "MIT"}
+
+# 说明：这里只放「跑服务必需」的依赖，且必须与 requirements.txt 保持一致。
+# 需要 OCR / PDF / Excel 解析能力时安装 [parsing]；需要跑评估时安装 [evaluation]。
 dependencies = [
-    "fastapi>=0.100.0",
-    "uvicorn[standard]>=0.23.0",
+    # Web
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "python-multipart>=0.0.9",
+    "websockets>=12.0",
+    # 配置
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.2.0",
+    "python-dotenv>=1.0.0",
+    # LangChain / LangGraph
     "langchain==1.2.15",
     "langgraph==1.1.10",
-    "langchain-community>=0.3.0",
-    "langchain-milvus>=0.1.0",
-    "langsmith>=0.1.0",
-    "pymilvus>=2.3.0",
+    "langchain-core>=1.0.0",
+    "langchain-community>=0.4.0",
+    "langchain-openai>=1.0.0",
+    "langchain-text-splitters>=1.0.0",
+    # 向量库
+    "langchain-milvus>=0.3.0",
+    "pymilvus>=2.6.0",
+    # 检索 / Embedding
     "dashscope>=1.14.0",
-    "sentence-transformers>=2.5.0",
     "rank-bm25>=0.2.2",
-    "pydantic>=2.0.0",
-    "pydantic-settings>=2.0.0",
+    "sentence-transformers>=2.5.0",
     "cachetools>=5.3.0",
+    # 可观测性
+    "langsmith>=0.2.0",
 ]
 
 [project.optional-dependencies]
-# 开发与测试依赖
 dev = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "httpx>=0.24.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.27.0",
 ]
-# RAGAS 评估依赖
-evaluation = [
-    "ragas>=0.1.0",
-    "datasets>=2.14.0",
-]
-# 文档解析依赖
+# 文档解析（体积大，按需安装）。注意 paddleocr 必须锁 2.x：
+# 3.x 改了构造函数参数与返回结构（见 app/parsers/ocr_engine.py 的兼容层）
 parsing = [
     "unstructured>=0.10.0",
-    "paddleocr>=2.7.0",
+    "paddleocr>=2.7.0,<3.0.0",
     "paddlepaddle>=2.5.0",
     "PyMuPDF>=1.23.0",
-    "pdfplumber>=0.9.0",
+    "pdfplumber>=0.10.0",
     "python-docx>=0.8.11",
+    "docx2txt>=0.8",
+    "Pillow>=10.0.0",
+]
+evaluation = [
+    "ragas>=0.2.0",
+    "datasets>=2.14.0",
 ]
 
 [build-system]
@@ -57,4 +73,13 @@ include = ["app*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+# 默认跳过需要外部服务（Milvus）的集成测试；单独跑：pytest -m integration
+addopts = "-q -m 'not integration'"
+markers = [
+    "integration: 需要外部服务（Milvus）的集成测试",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

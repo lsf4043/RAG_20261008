@@ -1,200 +1,233 @@
 """
-Query 处理服务（升级版新增，P1 优化）
-实现 Query 改写 / Multi-Query 扩展 / HyDE，提升复杂问题与多轮对话的检索召回率。
+Query 处理服务：改写（指代消解）+ 多查询扩展 + HyDE
 
-方法说明：
-- rewrite_query：结合对话历史改写 query，消解指代词（它/这个/那个等）
-- multi_query_expand：生成多个语义等价的 query 变体，用于多路检索
-- hyde：让 LLM 先生成假设答案，用假设答案做向量检索（提升召回）
+关键修复：
+- **一次 LLM 调用同时完成“改写 + 变体生成”**。旧实现是串行两次往返
+  （rewrite → multi_query），每次问答平白多 1~2 秒；
+- 支持 CRAG 重试提示（retry_hint）：第二轮必须真的换一种检索视角，
+  否则“重检索”就是原地空转；
+- 全部失败时退化为原始问题，绝不阻塞主流程。
 """
+from __future__ import annotations
+
 import re
-from typing import List, Optional, Dict
+from typing import Dict, List, Optional
+
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.core.llm import llm_service
+from app.core.llm import get_llm_service
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
-class QueryProcessor:
-    """Query 改写/扩展处理器"""
+class QueryPlan(BaseModel):
+    """结构化输出：改写后的主查询 + 检索变体"""
 
-    # ---- Query 改写（指代消解） ----
+    rewritten_query: str = Field(description="消解指代后、可独立理解的主查询")
+    variants: List[str] = Field(default_factory=list, description="语义等价但表述不同的检索变体")
 
-    def rewrite_query(self, question: str, history: Optional[List[Dict]] = None) -> str:
-        """
-        结合对话历史改写 query，消解指代词
 
-        Args:
-            question: 用户最新问题
-            history: 对话历史 [{role: user/assistant, content: ...}]
+_PLAN_PROMPT = """你是检索查询规划器，服务于一个中文知识库问答系统。
 
-        Returns:
-            改写后的完整问题
-        """
-        if not settings.QUERY_REWRITE_ENABLED:
-            return question
-
-        # 无历史时直接返回原问题，无需改写
-        if not history:
-            return question
-
-        # 将历史格式化为文本
-        history_text = "\n".join(
-            [f"{msg['role']}: {msg['content']}" for msg in history[-6:]]  # 只取最近 6 条
-        )
-
-        prompt = f"""你是一个对话改写助手。请根据对话历史，将用户的最新问题改写为一个独立、完整、无需上下文即可理解的问题。
+任务：
+1. 结合对话历史，把用户最新问题改写为「独立、完整、无需上下文即可理解」的查询；
+   消解“它 / 这个 / 那个 / 上述 / 前面提到的”等指代词，补全历史中出现的关键实体。
+2. 再生成 {n} 条语义等价但表述不同的检索变体，用于提升召回率。
 
 要求：
-1. 消解指代词（如"它"、"这个"、"那个"、"上述"等），替换为具体的实体
-2. 补充历史中提到的关键信息
-3. 只输出改写后的问题，不要输出任何解释或额外内容
-
+- 保持原问题语义，不要臆造新的约束条件；
+- 变体要覆盖不同说法/同义词/可能的知识库用词，不要只是换标点；
+- 如果问题很短或已经是独立问题，改写结果可以与原问题相同；
+- 只输出结构化结果，不要解释。
+{retry_hint}
 对话历史：
-{history_text}
+{history}
 
-用户最新问题：{question}
+用户最新问题：{question}"""
 
-改写后的问题："""
+_RETRY_HINT_TEMPLATE = """
+注意：上一轮用下列查询检索后没有找到相关内容，请换一个角度（更换同义词、上位词、
+拆解子问题、补充可能的文档用词），不要重复上一轮的查询：
+{previous}
+"""
 
-        try:
-            rewritten = llm_service.chat(
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,  # 改写任务用低温，保证稳定
-            ).strip()
-            # 清理可能的多余引号/换行
-            rewritten = rewritten.strip('"\' \n')
-            logger.info(f"Query 改写: '{question[:30]}' -> '{rewritten[:30]}'")
-            return rewritten or question
-        except Exception as e:
-            logger.warning(f"Query 改写失败，使用原问题: {str(e)}")
-            return question
 
-    # ---- Multi-Query 扩展 ----
+class QueryProcessor:
+    """Query 改写 / 扩展 / HyDE"""
 
-    def multi_query_expand(self, question: str) -> List[str]:
+    # ---------- 内部工具 ----------
+    @staticmethod
+    def _format_history(history: Optional[List[Dict[str, str]]], limit: int = 6) -> str:
+        if not history:
+            return "（无）"
+        recent = history[-limit:]
+        lines = []
+        for msg in recent:
+            role = "用户" if (msg or {}).get("role") == "user" else "助手"
+            content = str((msg or {}).get("content", ""))[:500]
+            lines.append(f"{role}: {content}")
+        return "\n".join(lines) or "（无）"
+
+    @staticmethod
+    def _dedupe(queries: List[str], limit: int) -> List[str]:
+        seen = set()
+        result: List[str] = []
+        for query in queries:
+            text = (query or "").strip().strip("\"'“”")
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(text)
+            if len(result) >= limit:
+                break
+        return result
+
+    # ---------- 组合调用 ----------
+    def plan_queries(
+        self,
+        question: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        retry_hint: Optional[str] = None,
+    ) -> List[str]:
         """
-        生成多个语义等价的 query 变体（Multi-Query）
-
-        Args:
-            question: 原始问题
-
-        Returns:
-            query 变体列表（含原问题）
-        """
-        if not settings.MULTI_QUERY_ENABLED:
-            return [question]
-
-        n = settings.MULTI_QUERY_NUM
-        prompt = f"""你是一个查询扩展助手。请将用户的问题改写为 {n} 个语义相同但表述不同的变体，用于多路检索以提升召回率。
-
-要求：
-1. 每个变体从不同角度表述同一个问题
-2. 保持语义一致，不要改变问题的含义
-3. 每行一个变体，不要编号、不要任何解释
-
-用户问题：{question}
-
-{n} 个变体："""
-
-        try:
-            response = llm_service.chat(
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-            ).strip()
-
-            # 按行解析变体，过滤空行和编号前缀
-            variants: List[str] = []
-            for line in response.split("\n"):
-                line = re.sub(r'^\s*\d+[.、)）]\s*', '', line).strip()  # 去掉编号
-                if line and line.lower() not in [v.lower() for v in variants]:
-                    variants.append(line)
-
-            # 确保原问题在列表中（去重后）
-            result = [question] + variants[:n]
-            logger.info(f"Multi-Query 扩展: 生成 {len(result)} 个查询变体")
-            return result
-        except Exception as e:
-            logger.warning(f"Multi-Query 扩展失败，仅使用原问题: {str(e)}")
-            return [question]
-
-    # ---- HyDE（假设答案） ----
-
-    def hyde(self, question: str) -> Optional[str]:
-        """
-        生成假设答案（HyDE），用于假设答案向量化后检索
+        生成用于检索的 query 列表（第一个元素为主查询）
 
         Args:
             question: 用户问题
-
-        Returns:
-            假设答案文本（若禁用则返回 None）
+            history: 对话历史
+            retry_hint: 上一轮失败的查询描述（CRAG 重检索时传入）
         """
+        rewrite_enabled = settings.QUERY_REWRITE_ENABLED
+        expand_enabled = settings.MULTI_QUERY_ENABLED
+
+        # 都关掉：直接用原问题
+        if not rewrite_enabled and not expand_enabled:
+            queries = [question]
+            hyde_answer = self.hyde(question)
+            if hyde_answer:
+                queries.append(hyde_answer)
+            return queries
+
+        n = settings.MULTI_QUERY_NUM if expand_enabled else 0
+        prompt = _PLAN_PROMPT.format(
+            n=n or 1,
+            retry_hint=retry_hint or "",
+            history=self._format_history(history),
+            question=question,
+        )
+
+        plan: Optional[QueryPlan] = None
+        try:
+            planner = get_llm_service().structured(QueryPlan, temperature=0.0)
+            result = planner.invoke([HumanMessage(content=prompt)])
+            if isinstance(result, QueryPlan):
+                plan = result
+            elif isinstance(result, dict):
+                plan = QueryPlan(**result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("结构化 Query 规划失败，退化为纯文本解析: %s", exc)
+            plan = self._plan_by_text(prompt)
+
+        base = question
+        variants: List[str] = []
+        if plan is not None:
+            base = (plan.rewritten_query or question).strip() or question
+            if expand_enabled:
+                variants = [v for v in plan.variants if v and v.strip()]
+
+        if not rewrite_enabled:
+            base = question
+        if not expand_enabled:
+            variants = []
+
+        queries = self._dedupe([base] + variants, limit=1 + max(n, 0))
+
+        hyde_answer = self.hyde(base)
+        if hyde_answer:
+            queries.append(hyde_answer)
+
+        logger.info("检索 query 规划完成：%s 条（retry=%s）", len(queries), bool(retry_hint))
+        return queries or [question]
+
+    def _plan_by_text(self, prompt: str) -> Optional[QueryPlan]:
+        """结构化输出不可用时的兜底：纯文本 + 行解析"""
+        try:
+            text = get_llm_service().chat(
+                [{"role": "user", "content": prompt + "\n\n请按以下格式输出：\n第一行：改写后的查询\n其余每行：一个检索变体"}],
+                temperature=0.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Query 规划完全失败，使用原问题: %s", exc)
+            return None
+
+        lines = [re.sub(r"^\s*[-*\d.、)）]+\s*", "", line).strip() for line in text.splitlines()]
+        lines = [line for line in lines if line]
+        if not lines:
+            return None
+        return QueryPlan(rewritten_query=lines[0], variants=lines[1:])
+
+    # ---------- 向后兼容的细粒度接口 ----------
+    def rewrite_query(self, question: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+        if not settings.QUERY_REWRITE_ENABLED or not history:
+            return question
+        return self.plan_queries(question, history)[0]
+
+    def multi_query_expand(self, question: str) -> List[str]:
+        if not settings.MULTI_QUERY_ENABLED:
+            return [question]
+        return self.plan_queries(question, None)
+
+    def hyde(self, question: str) -> Optional[str]:
         if not settings.HYDE_ENABLED:
             return None
-
-        prompt = f"""请简要回答以下问题，生成一个假设性答案（不需要完全准确，只需覆盖可能的答案要点）：
-
-问题：{question}
-
-假设答案："""
-
+        prompt = (
+            "请针对下面的问题写一段简短的假设性答案（不需要准确，覆盖可能的答案要点即可），"
+            "用于向量检索：\n\n问题："
+            f"{question}\n\n假设答案："
+        )
         try:
-            answer = llm_service.chat(
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.5,
+            answer = get_llm_service().chat(
+                [{"role": "user", "content": prompt}], temperature=0.5, max_tokens=300
             ).strip()
-            logger.info(f"HyDE 生成假设答案: {answer[:50]}...")
-            return answer
-        except Exception as e:
-            logger.warning(f"HyDE 生成失败: {str(e)}")
+            return answer or None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("HyDE 生成失败: %s", exc)
             return None
-
-    # ---- 综合处理：生成用于检索的 query 列表 ----
 
     def build_retrieval_queries(
         self,
         question: str,
-        history: Optional[List[Dict]] = None
+        history: Optional[List[Dict[str, str]]] = None,
+        retry_hint: Optional[str] = None,
     ) -> List[str]:
-        """
-        生成用于检索的 query 列表（整合改写 + 扩展 + HyDE）
+        return self.plan_queries(question, history, retry_hint=retry_hint)
 
-        Args:
-            question: 原始问题
-            history: 对话历史
-
-        Returns:
-            检索 query 列表（原始问题 + 改写问题 + 变体 + 假设答案）
-        """
-        queries: List[str] = []
-
-        # 1. Query 改写（多轮指代消解）
-        rewritten = self.rewrite_query(question, history)
-
-        # 2. Multi-Query 扩展
-        expanded = self.multi_query_expand(rewritten)
-
-        queries.extend(expanded)
-
-        # 3. HyDE 假设答案（可选）
-        hyde_answer = self.hyde(rewritten)
-        if hyde_answer:
-            queries.append(hyde_answer)
-
-        # 去重
-        seen = set()
-        deduped = []
-        for q in queries:
-            if q.lower() not in seen:
-                seen.add(q.lower())
-                deduped.append(q)
-
-        logger.info(f"生成检索 query 列表：共 {len(deduped)} 个")
-        return deduped
+    @staticmethod
+    def build_retry_hint(previous_queries: List[str]) -> str:
+        if not previous_queries:
+            return ""
+        listed = "\n".join(f"- {q[:120]}" for q in previous_queries[:5])
+        return _RETRY_HINT_TEMPLATE.format(previous=listed)
 
 
-# 全局 Query 处理器实例
-query_processor = QueryProcessor()
+_query_processor: Optional[QueryProcessor] = None
+
+
+def get_query_processor() -> QueryProcessor:
+    global _query_processor
+    if _query_processor is None:
+        _query_processor = QueryProcessor()
+    return _query_processor
+
+
+def __getattr__(name: str) -> object:
+    """兼容旧的 ``from app.core.query_processor import query_processor``"""
+    if name == "query_processor":
+        return get_query_processor()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

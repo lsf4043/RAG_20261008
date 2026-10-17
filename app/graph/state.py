@@ -1,70 +1,83 @@
 """
-LangGraph 状态定义（升级版核心）
-定义 RAG 流程的状态结构，作为状态机各节点之间传递的数据载体。
+LangGraph 状态定义
 
-状态字段说明：
-- question：用户原始问题
-- history：多轮对话历史
-- rewritten_query：指代消解后的查询
-- queries：用于检索的 query 列表（含 Multi-Query 变体、HyDE 假设答案）
-- documents：检索到的候选文档（去重合并后）
-- graded_documents：经过 CRAG 相关性评分后的文档
-- is_relevant：是否检索到相关内容
-- iteration：CRAG 重检索次数
-- answer：最终生成的答案
-- sources：答案引用来源
+字段说明：
+- 输入：question / history
+- Query 处理：rewritten_query / queries
+- 检索：documents（RRF 融合后）/ graded_documents（CRAG 通过）/ is_relevant
+- 控制：iteration（CRAG 轮次）/ candidate_k（每轮可动态放宽）
+- 生成：answer / sources / used_fallback（是否脱离知识库作答）
+- 诊断：degraded / notes（降级原因，直接暴露给前端，避免“静默降级”）
+- 请求级参数覆盖：top_k / temperature / max_tokens（让 API 参数真正生效）
 """
-from typing import TypedDict, List, Optional, Dict, Any
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, TypedDict
 
 from langchain_core.documents import Document
 
 
 class RAGState(TypedDict, total=False):
-    """RAG 流程状态（total=False 表示所有字段可选）"""
+    """RAG 流程状态（total=False：所有字段可选）"""
 
-    # 输入
-    question: str                              # 原始问题
-    history: List[Dict[str, str]]              # 对话历史 [{role, content}]
+    # ---------- 输入 ----------
+    question: str
+    history: List[Dict[str, str]]
 
-    # Query 处理
-    rewritten_query: str                       # 指代消解后的查询
-    queries: List[str]                         # 检索 query 列表
+    # ---------- 请求级参数 ----------
+    top_k: int
+    temperature: Optional[float]
+    max_tokens: Optional[int]
 
-    # 检索
-    documents: List[Document]                  # 检索候选文档（去重合并）
-    graded_documents: List[Document]           # CRAG 评分后的文档
-    is_relevant: bool                          # 是否存在相关文档
+    # ---------- Query 处理 ----------
+    rewritten_query: str
+    queries: List[str]
 
-    # CRAG 控制
-    iteration: int                             # 重检索迭代次数
+    # ---------- 检索 ----------
+    documents: List[Document]
+    graded_documents: List[Document]
+    is_relevant: bool
+    candidate_k: int
 
-    # 生成
-    answer: str                                # 最终答案
-    sources: List[Dict[str, Any]]              # 引用来源
-    used_fallback: bool                        # 是否走了无上下文 fallback
+    # ---------- CRAG 控制 ----------
+    iteration: int
+
+    # ---------- 生成 ----------
+    answer: str
+    sources: List[Dict[str, Any]]
+    used_fallback: bool
+
+    # ---------- 诊断 ----------
+    degraded: bool
+    notes: List[str]
 
 
-def initial_state(question: str, history: Optional[List[Dict[str, str]]] = None) -> RAGState:
-    """
-    构造初始状态
+def initial_state(
+    question: str,
+    history: Optional[List[Dict[str, str]]] = None,
+    top_k: Optional[int] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> RAGState:
+    """构造初始状态（请求级参数优先于全局配置）"""
+    from app.config import settings
 
-    Args:
-        question: 用户问题
-        history: 对话历史
-
-    Returns:
-        初始 RAGState
-    """
     return {
         "question": question,
         "history": history or [],
+        "top_k": int(top_k) if top_k else settings.RETRIEVAL_TOP_K,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
         "rewritten_query": question,
         "queries": [question],
         "documents": [],
         "graded_documents": [],
         "is_relevant": False,
+        "candidate_k": settings.RETRIEVAL_CANDIDATE_K,
         "iteration": 0,
         "answer": "",
         "sources": [],
         "used_fallback": False,
+        "degraded": False,
+        "notes": [],
     }
