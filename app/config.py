@@ -10,11 +10,18 @@
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
+from pathlib import Path
 from typing import List
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 项目根目录（app/config.py 的上一级）：.env 用绝对路径定位，
+# 避免从 app/ 等子目录启动时相对路径找不到 .env 而静默退回默认值
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_ENV_FILE = _PROJECT_ROOT / ".env"
 
 
 class ConfigurationError(RuntimeError):
@@ -25,7 +32,7 @@ class Settings(BaseSettings):
     """应用配置（单例，通过 get_settings 获取）"""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -128,6 +135,10 @@ class Settings(BaseSettings):
     RERANK_TOP_K: int = Field(5, ge=1, le=20)
     RERANK_MIN_SCORE: float = Field(0.0, ge=-100.0, le=100.0)  # 低于该分数直接丢弃
 
+    # HuggingFace 模型下载源（国内网络直连 huggingface.co 常因证书校验失败，
+    # 默认走镜像；海外环境可在 .env 中设为 https://huggingface.co）
+    HF_ENDPOINT: str = "https://hf-mirror.com"
+
     # 生成
     ALLOW_LLM_FALLBACK: bool = False  # 无检索结果时是否允许脱离知识库作答
 
@@ -200,3 +211,8 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+# huggingface_hub 在 import 时读取 HF_ENDPOINT，必须在首次导入前写入环境变量；
+# 用 setdefault 尊重用户已显式设置的系统环境变量
+if settings.HF_ENDPOINT:
+    os.environ.setdefault("HF_ENDPOINT", settings.HF_ENDPOINT)
