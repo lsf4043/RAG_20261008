@@ -199,15 +199,27 @@ class VectorStoreService:
             "请把 MILVUS_COLLECTION 改成新的集合名，或确认可丢弃后设置 MILVUS_DROP_OLD=true 重建。"
         )
 
+    def _uses_dynamic_fields(self) -> bool:
+        """集合是否为动态字段模式（metadata 不在 schema 里，但仍可查询）"""
+        store = self._store
+        return bool(getattr(store, "enable_dynamic_field", False))
+
     def _available_fields(self, requested: List[str]) -> List[str]:
-        """只请求集合里真实存在的字段（旧集合可能缺 raw_content 等）"""
-        if self._existing_fields is None:
+        """
+        计算可安全查询的字段
+
+        - 动态字段模式：schema 里只有 id/content/embedding，metadata 是动态字段，
+          **不能**按 schema 过滤，否则 document_id 等字段会被误判为不存在；
+        - 静态 schema 模式（历史遗留集合）：与真实字段取交集，避免查询报错。
+        """
+        if self._existing_fields is None or self._uses_dynamic_fields():
             return list(requested)
         return [name for name in requested if name in self._existing_fields]
 
     def _fit_document(self, document: Document) -> Document:
         """把 metadata 裁剪到集合已有字段，避免“未知字段”写入失败"""
-        if self._existing_fields is None:
+        if self._existing_fields is None or self._uses_dynamic_fields():
+            # 动态字段模式下任何 metadata 键都合法，绝不能过滤（否则元数据会被静默丢弃）
             return document
         metadata = {
             key: value
@@ -218,6 +230,31 @@ class VectorStoreService:
         if dropped:
             logger.debug("集合缺少字段 %s，写入时已丢弃", sorted(dropped))
         return Document(page_content=document.page_content, metadata=metadata)
+
+    def _count_rows(self, store: Milvus) -> Optional[int]:
+        """
+        精确统计行数
+
+        ``get_collection_stats`` 返回的 row_count 依赖 flush/compaction，删除后可能滞后；
+        这里优先用 ``count(*)``（Milvus 2.3+ 支持），失败再回退。
+        """
+        try:
+            rows = store.client.query(
+                self.collection_name, filter="", output_fields=["count(*)"]
+            )
+            if rows and isinstance(rows[0], dict):
+                for key, value in rows[0].items():
+                    if key.startswith("count"):
+                        return int(value)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("count(*) 失败，回退 row_count: %s", exc)
+
+        try:
+            stats = store.client.get_collection_stats(self.collection_name)
+            return int(stats.get("row_count", 0)) if isinstance(stats, dict) else None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取集合统计失败: %s", exc)
+            return None
 
     def health(self) -> Dict[str, Any]:
         """健康检查：真正探活（集合尚未创建不算不健康）"""
@@ -233,11 +270,10 @@ class VectorStoreService:
             if not store.client.has_collection(self.collection_name):
                 # 服务可达，但还没上传过任何文档 → 集合尚未创建，这是正常状态
                 return {**base, "status": "connected", "row_count": 0, "collection_exists": False}
-            stats = store.client.get_collection_stats(self.collection_name)
             return {
                 **base,
                 "status": "connected",
-                "row_count": int(stats.get("row_count", 0)) if isinstance(stats, dict) else None,
+                "row_count": self._count_rows(store),
                 "collection_exists": True,
             }
         except Exception as exc:  # noqa: BLE001
@@ -476,10 +512,9 @@ class VectorStoreService:
     def get_collection_stats(self) -> Dict[str, Any]:
         try:
             store = self._ensure_store()
-            stats = store.client.get_collection_stats(self.collection_name)
             return {
                 "collection_name": self.collection_name,
-                "total_vectors": int(stats.get("row_count", 0)) if isinstance(stats, dict) else 0,
+                "total_vectors": self._count_rows(store),
             }
         except Exception as exc:  # noqa: BLE001
             logger.error("获取集合统计失败: %s", exc)

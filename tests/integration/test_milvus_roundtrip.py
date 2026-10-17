@@ -127,6 +127,35 @@ def test_delete_is_idempotent(milvus_service):
     assert milvus_service.delete_by_document_id("not-exist-doc") == 0
 
 
+def test_metadata_survives_reconnect(milvus_service):
+    """
+    回归：集合创建后重启（此时 schema 已知），metadata 不能被“字段裁剪”逻辑丢掉
+
+    曾经的问题：动态字段模式下 schema 只有 id/content/embedding，
+    按 schema 过滤会把 document_id 等字段全部过滤掉 →
+    iter_documents 拿不到元数据（BM25 去重失效、来源显示“未知文档”）、
+    get_document_list 直接返回空。
+    """
+    from app.core.vector_store import VectorStoreService
+
+    milvus_service.add_documents(_docs("doc-restart", 2))
+
+    fresh = VectorStoreService()
+    fresh.collection_name = TEST_COLLECTION
+    assert fresh.connect()
+    assert fresh._existing_fields is not None, "集合已存在，应读到 schema"
+
+    documents = fresh.iter_documents()
+    assert len(documents) == 2
+    assert all(doc.metadata.get("document_id") == "doc-restart" for doc in documents)
+    assert all(doc.metadata.get("raw_content") for doc in documents)
+
+    listed = fresh.get_document_list()
+    assert len(listed) == 1
+    assert listed[0]["document_id"] == "doc-restart"
+    assert listed[0]["chunk_count"] == 2
+
+
 def test_rejects_unsafe_document_id(milvus_service):
     from app.core.exceptions import MilvusException
 

@@ -48,7 +48,8 @@ class LLMService:
         self.temperature = settings.LLM_TEMPERATURE
         self._base: Any = None
         self._variants: Dict[tuple, Any] = {}
-        self._lock = threading.Lock()
+        # 可重入：即使将来有人在持锁路径里再取一次锁也不会自死锁
+        self._lock = threading.RLock()
 
     # ---------- 客户端 ----------
     def is_configured(self) -> bool:
@@ -82,19 +83,25 @@ class LLMService:
 
     def _variant(self, temperature: Optional[float] = None, max_tokens: Optional[int] = None) -> Any:
         """按参数复用模型变体（共享底层连接池，不重复创建客户端）"""
+        # 注意：必须先解析 base 再进入临界区。
+        # 旧实现先 `with self._lock:` 再调 `self.base`，而 base 内部又要拿同一把锁，
+        # 普通 Lock 不可重入 → 首次调用走 structured()/指定 temperature 时会自死锁
+        # （表现为请求 120s 超时且没有任何日志）。
+        base = self.base
+
         updates: Dict[str, Any] = {}
         if temperature is not None:
             updates["temperature"] = temperature
         if max_tokens is not None:
             updates["max_tokens"] = max_tokens
         if not updates:
-            return self.base
+            return base
 
         key = tuple(sorted(updates.items()))
         with self._lock:
             variant = self._variants.get(key)
             if variant is None:
-                variant = self.base.model_copy(update=updates)
+                variant = base.model_copy(update=updates)
                 self._variants[key] = variant
             return variant
 

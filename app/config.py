@@ -24,6 +24,43 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ENV_FILE = _PROJECT_ROOT / ".env"
 
 
+# 阿里百炼通用文本向量模型的规格表（来源：百炼官方「同步接口API详情」）
+# - dimensions：允许的输出维度，**必须与 EMBEDDING_DIMENSION 一致**
+# - max_batch：单请求最大行数（v3/v4 为 10，v1/v2 为 25）
+# - max_tokens：单行最大 token 数（v3/v4 为 8192，v1/v2 为 2048）
+# - instruct：是否支持查询侧任务指令（Qwen3-Embedding 系列的检索增强用法）
+EMBEDDING_MODEL_SPECS: dict[str, dict] = {
+    "text-embedding-v4": {
+        "dimensions": {2048, 1536, 1024, 768, 512, 256, 128, 64},
+        "default_dimension": 1024,
+        "max_batch": 10,
+        "max_tokens": 8192,
+        "instruct": True,
+    },
+    "text-embedding-v3": {
+        "dimensions": {1024, 768, 512, 256, 128, 64},
+        "default_dimension": 1024,
+        "max_batch": 10,
+        "max_tokens": 8192,
+        "instruct": True,
+    },
+    "text-embedding-v2": {
+        "dimensions": {1536},
+        "default_dimension": 1536,
+        "max_batch": 25,
+        "max_tokens": 2048,
+        "instruct": False,
+    },
+    "text-embedding-v1": {
+        "dimensions": {1536},
+        "default_dimension": 1536,
+        "max_batch": 25,
+        "max_tokens": 2048,
+        "instruct": False,
+    },
+}
+
+
 class ConfigurationError(RuntimeError):
     """配置缺失或不合法（消息面向使用者，包含修复指引）"""
 
@@ -64,8 +101,17 @@ class Settings(BaseSettings):
     MILVUS_QUERY_BATCH: int = Field(500, ge=1, le=16384)
 
     # ============ Embedding 配置 ============
-    EMBEDDING_MODEL: str = "text-embedding-v2"
+    # 模型规格见 EMBEDDING_MODEL_SPECS；切换模型时 **必须** 同步调整 EMBEDDING_DIMENSION，
+    # 否则 Milvus 集合维度与向量维度不一致，写入会失败（启动时会校验并明确报错）。
+    EMBEDDING_MODEL: str = "text-embedding-v4"
     EMBEDDING_DIMENSION: int = Field(1536, ge=1)
+    # 单请求行数上限：v3/v4 为 10，v1/v2 为 25；超过模型上限时会被自动收敛
+    EMBEDDING_BATCH_SIZE: int = Field(10, ge=1, le=25)
+    # 查询侧任务指令（仅 v3/v4 生效；留空表示不发送 instruct）
+    # Qwen3-Embedding 官方建议用一句英文描述检索任务，可提升召回
+    EMBEDDING_QUERY_INSTRUCT: str = (
+        "Given a user question, retrieve the passages from the knowledge base that answer it"
+    )
 
     # ============ 大模型配置（DeepSeek，OpenAI 兼容接口）============
     DEEPSEEK_MODEL: str = "deepseek-chat"
@@ -176,6 +222,26 @@ class Settings(BaseSettings):
         return self.LANGSMITH_TRACING and bool(self.LANGSMITH_API_KEY)
 
     # ============ 校验 ============
+    @model_validator(mode="after")
+    def _validate_embeddings(self) -> "Settings":
+        """Embedding 模型与维度必须匹配，否则写入 Milvus 时才报错就太晚了"""
+        spec = EMBEDDING_MODEL_SPECS.get(self.EMBEDDING_MODEL)
+        if spec is None:
+            # 未知模型（例如私有部署的自定义模型）：不做维度假设，仅提示
+            return self
+        allowed = sorted(spec["dimensions"])
+        if self.EMBEDDING_DIMENSION not in spec["dimensions"]:
+            raise ValueError(
+                f"EMBEDDING_DIMENSION={self.EMBEDDING_DIMENSION} 不被 {self.EMBEDDING_MODEL} 支持；"
+                f"可选值: {allowed}（默认 {spec['default_dimension']}）"
+            )
+        if self.EMBEDDING_BATCH_SIZE > spec["max_batch"]:
+            raise ValueError(
+                f"EMBEDDING_BATCH_SIZE={self.EMBEDDING_BATCH_SIZE} 超过 {self.EMBEDDING_MODEL} "
+                f"单请求上限 {spec['max_batch']} 行"
+            )
+        return self
+
     @model_validator(mode="after")
     def _validate_combinations(self) -> "Settings":
         if self.CHUNK_OVERLAP >= self.CHUNK_SIZE:

@@ -18,7 +18,7 @@ Query 改写/扩展、CRAG 批量相关性评估与重检索、Cross-Encoder 重
 | 组件库 | LangChain 1.2.x（ChatModel / Embeddings / Retriever / CrossEncoder） |
 | 向量库 | Milvus（langchain-milvus 0.4.x / pymilvus 3.x，HNSW + COSINE） |
 | LLM | DeepSeek（OpenAI 兼容接口） |
-| Embedding | 阿里百炼 DashScope `text-embedding-v2` |
+| Embedding | 阿里百炼 DashScope `text-embedding-v4`（可配 2048/1536/1024… + 查询指令） |
 | 重排 | `BAAI/bge-reranker-base`（sentence-transformers CrossEncoder） |
 | 可观测 | LangSmith（环境变量自动追踪 + 业务级 `@traceable`） |
 | 评估 | RAGAS（含消融对比） |
@@ -83,12 +83,48 @@ Query 改写/扩展、CRAG 批量相关性评估与重检索、Cross-Encoder 重
 
 ### 2.5 测试与评估
 
-- 新增 **44 个单元测试**（分割器、去重 key、加权 RRF、缓存失效、CRAG 决策/批量评分、配置校验、API 状态码与安全）。
-- 新增 **5 个 Milvus 集成测试**（真实读写，含完整 E2E：上传 → 检索 → 问答 → 删除 → 缓存失效）。
+- 新增 **62 个单元测试**（分割器、去重 key、加权 RRF、缓存失效、CRAG 决策/批量评分、配置校验、
+  Embedding v4 维度/批处理/指令、LLM 自死锁回归、API 状态码与安全）。
+- 新增 **7 个 Milvus 集成测试**（真实读写，含完整 E2E：上传 → 检索 → 问答 → 删除 → 缓存失效，
+  以及“重启后元数据不丢”的回归）。
   `pytest` 默认跳过 `integration`，`pytest -m integration` 单独运行。
 - RAGAS 脚本重写：接上 DeepSeek + DashScope（旧版默认要 `OPENAI_API_KEY`，从未跑通）、
   用 `to_pandas()` 取指标（旧版读 `_scores` 得到空报告）、支持 `--ingest` 灌语料、
   支持 `--variants` 跑**消融对比**（纯向量 / 混合 / +重排 / 全量）。
+
+### 2.6 Embedding 升级到 text-embedding-v4
+
+| 项目 | 说明 |
+|---|---|
+| 维度 | v4 支持 2048 / 1536 / 1024（默认） / 768 / 512 / 256 / 128 / 64；本项目用 **1536**（与 Milvus 集合一致） |
+| 上下文 | 单行 8192 token（v2 只有 2048，长 chunk 会被静默截断） |
+| 批大小 | v3/v4 单请求上限 **10 行**（v1/v2 为 25），客户端自动分批 |
+| 查询指令 | v3/v4 支持 `instruct`，查询侧附带任务描述可提升召回（`EMBEDDING_QUERY_INSTRUCT`） |
+| 价格 | v4 更低（0.0005 元/千 token vs v2 的 0.0007） |
+
+**为什么不再用 `langchain_community.DashScopeEmbeddings`**：该类
+`model_config = ConfigDict(extra="forbid")`，只向 SDK 传 `input` / `text_type` / `model`，
+无法传 `dimension` / `output_type` / `instruct`。而 v4 默认输出 **1024 维**，
+只改模型名会导致向量维度与 `EMBEDDING_DIMENSION` / Milvus 集合不一致，写入直接失败。
+因此 `app/core/embeddings.py` 改为直接调用 `dashscope.TextEmbedding.call`（保留缓存、
+批处理、重试与维度校验），并新增 `EMBEDDING_MODEL_SPECS` 做“模型 ↔ 维度”启动校验。
+
+**迁移规则（重要）**：
+
+1. `EMBEDDING_MODEL` / `EMBEDDING_DIMENSION` / Milvus 集合维度三者必须一致，否则启动即报错；
+2. 换模型 = 换向量空间，**旧向量不可复用**：需新建集合（或 `MILVUS_DROP_OLD=true`）并重新入库；
+3. 回退到 v2 时，2048/1536 之外的维度会被配置校验拒绝。
+
+### 2.7 两个运行期缺陷（真实链路测试暴露）
+
+- **LLM 自死锁**：`LLMService._variant()` 先持有 `threading.Lock` 再调 `self.base`，
+  而 `base` 内部又要拿同一把锁 → 首次调用走 `structured()`/指定 `temperature` 时永久卡住，
+  表现为“问答请求 120s 超时且没有任何节点日志”。已改为先解析 `base` 再进临界区，并用 `RLock` 兜底
+  （`tests/unit/test_llm.py` 有专门的死锁回归测试）。
+- **动态字段被“字段裁剪”误杀**：集合重启后 schema 已知（只有 id/content/embedding），
+  旧逻辑按 schema 过滤 metadata，导致 `document_id` 等动态字段被丢弃 →
+  `documents/list` 返回空、来源显示“未知文档”、BM25 与向量结果无法去重。
+  已改为“动态字段模式不过滤”，并加集成回归测试。
 
 ---
 
@@ -152,6 +188,7 @@ pip install -r requirements.txt                     # 含文档解析能力
 
 # 2. 配置
 cp .env.example .env    # 填入 DEEPSEEK_API_KEY / DASHSCOPE_API_KEY / MILVUS_*
+# 若仓库未包含 .env.example，请按第 5 节配置表自行创建 .env
 
 # 3. 启动
 python -m app.main
@@ -177,6 +214,10 @@ python -m app.main
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
+| `EMBEDDING_MODEL` | `text-embedding-v4` | 向量模型；切换需同步改维度并重建集合 |
+| `EMBEDDING_DIMENSION` | `1536` | 必须落在模型允许集合内（v4: 2048/1536/1024/768/512/256/128/64） |
+| `EMBEDDING_BATCH_SIZE` | `10` | 单请求行数，不得超过模型上限（v4=10，v2=25） |
+| `EMBEDDING_QUERY_INSTRUCT` | 一句检索指令 | 查询侧 `instruct`（仅 v3/v4；留空则不发） |
 | `ALLOW_LLM_FALLBACK` | `false` | 检索不到内容时是否允许脱离知识库作答；false = 直接拒答 |
 | `VECTOR_WEIGHT` / `BM25_WEIGHT` | `1.0` / `1.0` | 加权 RRF 的通道权重 |
 | `RETRIEVAL_CANDIDATE_K` | `20` | 召回候选数；CRAG 重试时自动放宽 |
@@ -264,7 +305,7 @@ python -m tests.evaluation.run_ragas_eval --variants hybrid_rerank
 ## 9. 部署
 
 ```bash
-cp .env.example .env      # 填好密钥
+cp .env.example .env      # 填好密钥（无模板时按第 5 节配置表创建）
 docker compose -f docker/docker-compose.yml up -d --build
 
 # 需要本地起 Milvus 时
@@ -296,6 +337,9 @@ docker compose -f docker/docker-compose.yml --profile milvus up -d
 | 上传返回 `schema 不兼容` | `MILVUS_COLLECTION` 指向了其它项目的集合，换一个专用集合名（或 `MILVUS_DROP_OLD=true` 重建） |
 | `/health/ready` 返回 503 | 看响应里的 `milvus.status / schema / llm_configured`；`row_count` 需要 flush 才准确，正常现象 |
 | 问答一直 `used_fallback=true` | 知识库为空或检索不到；先 `/documents/list` 确认数据，再看 `notes` |
+| 问答 120s 超时且日志里没有任何节点输出 | ①`LLMService._variant` 自死锁（已在 2.7 修复）；②DeepSeek 不支持 `json_schema`，`with_structured_output` 会 400 并走文本兜底（`notes` 里会出现“CRAG 评分失败”） |
+| `documents/list` 返回 0 但问答有来源 | 动态字段被字段裁剪误杀（已在 2.7 修复）；确认 `_fit_document` 不过滤动态字段 |
+| 上传报 `Embedding 维度不符` | `EMBEDDING_DIMENSION` 与模型默认维度或 Milvus 集合维度不一致 |
 | `paddleocr` 报参数错误 | v3 改了 API，已用 `app/parsers/ocr_engine.py` 兼容；若仍失败请锁 `paddleocr<3` |
 
 ## License
