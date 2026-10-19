@@ -15,14 +15,18 @@ import threading
 
 from langgraph.graph import END, START, StateGraph
 
+from app.core.intent_router import ROUTE_DIRECT
 from app.graph.nodes import (
     decide_after_grade,
+    decide_after_route,
+    generate_direct_node,
     generate_node,
     grade_documents_node,
     increment_iteration_node,
     query_rewrite_node,
     rerank_node,
     retrieve_node,
+    route_intent_node,
 )
 from app.graph.state import RAGState
 from app.utils.logger import get_logger
@@ -61,19 +65,35 @@ def build_retrieval_graph():
 
 
 def build_graph():
-    """完整状态机：检索子图 + 生成"""
+    """
+    完整状态机：意图路由 →（直答 | 检索子图 + 生成）
+
+    - 闲聊/通用任务：route → generate_direct → END（不检索，不浪费 Embedding）
+    - 知识类问题：  route → retrieval → generate → END
+    """
     retrieval = build_retrieval_graph()
 
     workflow = StateGraph(RAGState)
+    workflow.add_node("route", route_intent_node)
     workflow.add_node("retrieval", retrieval)
     workflow.add_node("generate", generate_node)
+    workflow.add_node("generate_direct", generate_direct_node)
 
-    workflow.add_edge(START, "retrieval")
+    workflow.add_edge(START, "route")
+    workflow.add_conditional_edges(
+        "route",
+        decide_after_route,
+        {
+            ROUTE_DIRECT: "generate_direct",
+            "rag": "retrieval",
+        },
+    )
     workflow.add_edge("retrieval", "generate")
     workflow.add_edge("generate", END)
+    workflow.add_edge("generate_direct", END)
 
     compiled = workflow.compile()
-    logger.info("RAG 状态机编译完成（Agentic RAG + CRAG）")
+    logger.info("RAG 状态机编译完成（意图路由 + Agentic RAG + CRAG）")
     return compiled
 
 

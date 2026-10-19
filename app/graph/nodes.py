@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from app.config import settings
 from app.core.documents import copy_document, doc_key, doc_name, doc_text, doc_title
 from app.core.exceptions import LLMException
+from app.core.intent_router import ROUTE_DIRECT, ROUTE_RAG, classify_intent
 from app.core.llm import get_llm_service
 from app.core.query_processor import QueryProcessor, get_query_processor
 from app.core.vector_store import get_vector_store_service
@@ -90,6 +91,38 @@ def _rrf_fusion(
         doc.metadata["rrf_score"] = round(float(score), 6)
         results.append(doc)
     return results
+
+
+# ============================================================
+# 节点 0：意图路由（闲聊直答 / 知识库检索）
+# ============================================================
+def route_intent_node(state: RAGState) -> Dict[str, Any]:
+    """
+    判断本次请求是否需要检索知识库
+
+    - direct：闲聊、寒暄、通用写作/翻译 → 不检索，直接让模型回答
+    - rag   ：知识类问题 → 走完整 RAG 链路
+
+    规则判定为 0 成本；只有规则无法判定的模糊短句才会多花一次极小 LLM 调用。
+    """
+    question = state["question"]
+    history = state.get("history") or []
+    notes = list(state.get("notes") or [])
+
+    decision = classify_intent(question, history)
+    label = "直接作答" if decision.is_direct else "知识库检索"
+    logger.info(
+        "[route_intent] %s（来源=%s，理由=%s）", label, decision.source, decision.reason
+    )
+    notes.append(f"意图路由：{label}（{decision.reason}）")
+
+    return {"route": decision.route, "notes": notes}
+
+
+def decide_after_route(state: RAGState) -> str:
+    """条件边：direct → 直答节点；其他 → 检索子图"""
+    route = state.get("route") or ROUTE_RAG
+    return ROUTE_DIRECT if route == ROUTE_DIRECT else "rag"
 
 
 # ============================================================
@@ -260,6 +293,19 @@ def _grade_batch(question: str, docs: List[Document]) -> Optional[List[bool]]:
 
 
 def grade_documents_node(state: RAGState) -> Dict[str, Any]:
+    """
+    CRAG 相关性评分节点：一次 LLM 调用批量判断候选文档能否回答用户问题
+
+    行为要点：
+    - 只评分前 CRAG_MAX_GRADE_DOCS 篇（后面的文档本来也会被 rerank 截断）；
+    - 评分失败时 fail-open（全部保留）并标记 degraded，宁可多留不可错杀；
+    - 只在 Document 副本上写 crag_relevant 标记，不污染检索阶段的原始对象；
+    - 相关文档数 >= CRAG_MIN_RELEVANT 时 is_relevant 为 True，
+      供 decide_after_grade 决定是否需要重检索。
+
+    Returns:
+        状态更新：graded_documents / is_relevant / degraded / notes
+    """
     documents = list(state.get("documents") or [])
     question = state.get("rewritten_query") or state["question"]
     notes = list(state.get("notes") or [])
@@ -312,6 +358,12 @@ def decide_after_grade(state: RAGState) -> str:
     if not settings.CRAG_ENABLED:
         return "rerank"
 
+    # 本轮一条候选都没召回：知识库为空 / 向量库不可用，
+    # 换个问法也不可能变出内容来，重试只是白等两轮（空库时能省 8s+）
+    if not state.get("documents"):
+        logger.info("[route] 本轮没有召回任何候选文档，跳过重检索")
+        return "rerank"
+
     # 没有任何改写能力时，重检索只会拿到一模一样的 query，属于纯空转
     can_rephrase = (
         settings.QUERY_REWRITE_ENABLED or settings.MULTI_QUERY_ENABLED or settings.HYDE_ENABLED
@@ -332,6 +384,19 @@ def decide_after_grade(state: RAGState) -> str:
 # 节点 4：重排序
 # ============================================================
 def rerank_node(state: RAGState) -> Dict[str, Any]:
+    """
+    重排序节点：对 CRAG 过滤后的文档按与问题的相关性重新排序并截断
+
+    行为要点：
+    - 输入取 graded_documents（CRAG 评分输出），top_k 优先读请求状态，
+      缺省回退到 RETRIEVAL_TOP_K；
+    - RERANK_ENABLED 关闭时不排序，直接截断前 top_k 篇；
+    - RERANK_MIN_SCORE > 0 时按 rerank_score 过滤弱相关文档，过滤数量记入 notes；
+    - 输出 documents 供生成节点构造上下文使用。
+
+    Returns:
+        状态更新：documents（最终入选文档）/ notes
+    """
     documents = list(state.get("graded_documents") or [])
     question = state.get("rewritten_query") or state["question"]
     top_k = int(state.get("top_k") or settings.RETRIEVAL_TOP_K)
@@ -489,6 +554,66 @@ def generate_node(state: RAGState) -> Dict[str, Any]:
         "used_fallback": not has_context,
         "degraded": degraded,
         "notes": notes,
+    }
+
+
+# ============================================================
+# 节点 5：通用直答（不检索知识库）
+# ============================================================
+DIRECT_SYSTEM_PROMPT = """你是一个友好、可靠的通用助手。
+本轮对话**没有**检索知识库，你的回答来自自身的通用知识与推理能力。
+
+回答要求：
+1. 寒暄/闲聊：简短自然，不要长篇大论，也不要刻意卖弄；
+2. 写作、翻译、改写、计算、解释概念等任务：直接完成，必要时给出步骤；
+3. 如果问题涉及具体产品文档、内部资料、专有数据（即需要查知识库才能准确回答），
+   请明确说明“这需要查询知识库才能准确回答”，不要编造事实；
+4. 不确定时就说不确定，使用与用户相同的语言作答。"""
+
+
+def build_direct_messages(
+    question: str,
+    history: List[Dict[str, str]],
+) -> List[BaseMessage]:
+    """构造通用直答的 messages（与 RAG 生成共用 history 处理方式）"""
+    messages: List[BaseMessage] = [SystemMessage(content=DIRECT_SYSTEM_PROMPT)]
+    for msg in history or []:
+        role = (msg or {}).get("role", "user")
+        content = str((msg or {}).get("content", ""))
+        if not content:
+            continue
+        messages.append(AIMessage(content=content) if role == "assistant" else HumanMessage(content=content))
+    messages.append(HumanMessage(content=question))
+    return messages
+
+
+def generate_direct_node(state: RAGState) -> Dict[str, Any]:
+    """闲聊 / 通用任务：不检索知识库，直接生成"""
+    question = state["question"]
+    history = list(state.get("history") or [])
+    notes = list(state.get("notes") or [])
+
+    messages = build_direct_messages(question, history)
+    logger.info("[generate_direct] 通用直答（未检索知识库）")
+
+    try:
+        answer = get_llm_service().invoke_messages(
+            messages,
+            temperature=state.get("temperature"),
+            max_tokens=state.get("max_tokens"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[generate_direct] 生成失败: %s", exc, exc_info=True)
+        raise LLMException("生成回答失败：模型调用异常，请稍后重试（详情见服务端日志）") from exc
+
+    return {
+        "answer": answer,
+        "sources": [],
+        # used_fallback=True 表示“本次回答没有知识库依据”，前端据此提示
+        "used_fallback": True,
+        "degraded": False,
+        "route": ROUTE_DIRECT,
+        "notes": notes + ["通用对话直接作答（未检索知识库）"],
     }
 
 

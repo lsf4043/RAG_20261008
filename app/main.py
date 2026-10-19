@@ -63,13 +63,22 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("Milvus 向量库连接失败：向量检索不可用，BM25 索引将为空")
 
-    # 4. 预加载重排序模型（失败不影响启动；关闭重排时不加载，省内存和时间）
+    # 4. 重排序：主通道为 qwen3.7-text-rerank（异常自动降级），本地模型后台预热作为兜底；
+    #    守护线程加载，不阻塞启动、不占线程池（关闭重排时不加载）
     if settings.RERANK_ENABLED:
-        logger.info("正在预加载重排序模型...")
-        await thread_pool.run_sync(get_reranker_service().initialize)
-        logger.info("重排序模型预加载完成，可用=%s", get_reranker_service().is_available())
+        reranker = get_reranker_service()
+        if reranker.provider == "dashscope":
+            logger.info(
+                "重排序主通道: %s（调用异常时自动降级本地 %s）",
+                settings.RERANK_API_MODEL,
+                settings.RERANKER_MODEL,
+            )
+        if reranker.warm_up_async():
+            logger.info("本地重排序模型已转入后台加载，作为 API 异常时的兜底通道")
+        else:
+            logger.info("本地重排序模型已在加载或已就绪，跳过重复预热")
     else:
-        logger.info("RERANK_ENABLED=false，跳过重排序模型加载")
+        logger.info("RERANK_ENABLED=false，跳过重排序")
 
     # 5. 编译状态机（同时校验图结构）
     get_graph()

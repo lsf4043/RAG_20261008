@@ -149,10 +149,19 @@ def test_full_rag_flow(e2e_env):
     answer = client.post("/api/v1/chat/query", json={"question": "Milvus 是什么？", "top_k": 3})
     assert answer.status_code == 200, answer.text
     payload = answer.json()["data"]
+    assert payload["route"] == "rag", "知识类问题应走检索"
     assert payload["used_fallback"] is False
     assert payload["sources"], "应该返回引用来源"
     assert payload["sources"][0]["document_name"] == "Milvus 说明"
     assert "Milvus" in payload["answer"]
+
+    # 4.1) 闲聊：不应走检索，也不应返回“未命中知识库”的拒答
+    greeting = client.post("/api/v1/chat/query", json={"question": "你好", "top_k": 3})
+    assert greeting.status_code == 200, greeting.text
+    greeting_data = greeting.json()["data"]
+    assert greeting_data["route"] == "direct", "闲聊应走通用直答"
+    assert greeting_data["sources"] == []
+    assert "知识库中没有检索到" not in greeting_data["answer"]
 
     # 5) 再问一次：应命中查询缓存
     cached = client.post("/api/v1/chat/query", json={"question": "Milvus 是什么？", "top_k": 3})
@@ -198,5 +207,13 @@ def test_stream_endpoint(e2e_env):
     assert "event: sources" in body
     assert "event: complete" in body
     assert "Milvus" in body
+
+    # 闲聊走流式直答：不应出现检索进度，complete 里 route=direct
+    greeting = client.post("/api/v1/chat/stream", json={"question": "你好", "top_k": 3})
+    assert greeting.status_code == 200
+    greeting_body = greeting.text
+    assert '"route": "direct"' in greeting_body
+    assert "event: answer" in greeting_body
+    assert "正在检索知识库" not in greeting_body
     # 生成阶段是 token 级流式：至少出现两次 answer 事件
     assert body.count("event: answer") >= 2

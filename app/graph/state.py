@@ -29,6 +29,9 @@ class RAGState(TypedDict, total=False):
     temperature: Optional[float]
     max_tokens: Optional[int]
 
+    # ---------- 意图路由 ----------
+    route: str          # direct（闲聊直答）/ rag（知识库检索）
+
     # ---------- Query 处理 ----------
     rewritten_query: str
     queries: List[str]
@@ -68,6 +71,7 @@ def initial_state(
         "top_k": int(top_k) if top_k else settings.RETRIEVAL_TOP_K,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "route": "rag",  # 默认按知识库问题处理，由 route_intent_node 覆盖
         "rewritten_query": question,
         "queries": [question],
         "documents": [],

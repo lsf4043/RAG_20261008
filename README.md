@@ -19,7 +19,7 @@ Query 改写/扩展、CRAG 批量相关性评估与重检索、Cross-Encoder 重
 | 向量库 | Milvus（langchain-milvus 0.4.x / pymilvus 3.x，HNSW + COSINE） |
 | LLM | DeepSeek（OpenAI 兼容接口） |
 | Embedding | 阿里百炼 DashScope `text-embedding-v4`（可配 2048/1536/1024… + 查询指令） |
-| 重排 | `BAAI/bge-reranker-base`（sentence-transformers CrossEncoder） |
+| 重排 | 阿里百炼 `qwen3.7-text-rerank`（商业 API，复用 `DASHSCOPE_API_KEY`；异常自动降级 `BAAI/bge-reranker-base` 本地 CrossEncoder） |
 | 可观测 | LangSmith（环境变量自动追踪 + 业务级 `@traceable`） |
 | 评估 | RAGAS（含消融对比） |
 | 解析 | PyMuPDF + pdfplumber + PaddleOCR + python-docx + unstructured |
@@ -126,23 +126,59 @@ Query 改写/扩展、CRAG 批量相关性评估与重检索、Cross-Encoder 重
   `documents/list` 返回空、来源显示“未知文档”、BM25 与向量结果无法去重。
   已改为“动态字段模式不过滤”，并加集成回归测试。
 
+### 2.8 意图路由（Adaptive RAG）
+
+**问题**：以前任何输入（包括“你好”“谢谢”）都会走完整 RAG 链路：Query 改写 → 混合检索 →
+CRAG 评分 → 生成。知识库为空或问的是闲聊时，还会直接拒答——既慢，体验也差。
+
+**现在**：状态机入口先做一次意图判定，**先便宜后昂贵**：
+
+| 判定层 | 输入示例 | 结果 | 额外开销 |
+|---|---|---|---|
+| 规则：寒暄/闲聊 | 你好、谢谢、再见、你是谁、在吗 | 直接作答 | 0 |
+| 规则：通用任务 | 帮我写祝福语、翻译成英文、总结这段话、讲个笑话 | 直接作答 | 0 |
+| 规则：知识特征 | 什么/怎么/为什么/配置/报错…，或含问号 | 走 RAG | 0 |
+| 规则：多轮指代 | 有历史时的“它呢”“那个怎么配” | 走 RAG | 0 |
+| 规则：长句 | 长度 ≥ `ROUTER_LONG_TEXT_THRESHOLD` | 走 RAG | 0 |
+| LLM 兜底 | 极短且模糊，如“帮我看看” | A/B 单字母分类（`max_tokens=4`） | 1 次极小调用 |
+
+- 判定失败/无法解析 → **保守回退 RAG**（把知识问题误判成闲聊会产生幻觉，代价更大）。
+- 直答走独立的 `generate_direct` 节点，系统提示明确写“本轮未检索知识库，不要编造”，
+  响应里返回 `route="direct"`、`used_fallback=true`、`sources=[]`，前端显示“💬 通用回答”。
+- 同时修掉一个空转：**本轮一条候选都没召回时不再触发 CRAG 重检索**
+  （空知识库下能省 8s+，`decide_after_grade` 里 2 行守卫 + 单测）。
+
+实测（真实 DeepSeek + v4 Embedding）：
+
+| 输入 | 路由 | 耗时 | 结果 |
+|---|---|---|---|
+| 你好 | direct | **0.77s** | “你好！有什么可以帮你的吗？” |
+| 谢谢你！ | direct | 0.65s | 自然回复 |
+| 翻译成英文：今天天气不错 | direct | 0.62s | The weather is nice today. |
+| Milvus 常用什么索引和度量？（有文档） | rag | 4.24s | 引用【知识片段 1】，答出 HNSW + COSINE |
+
+关闭方式：`ROUTER_ENABLED=false` 即退回“全部走 RAG”的旧行为。
+
 ---
 
 ## 3. 架构
 
 ```
-                 ┌──────────────── 检索子图（被两条入口共用）────────────────┐
-START → retrieval │ query_rewrite → retrieve → grade ──┬→ increment_iteration ─┐
-                 │                                     │        （回到改写）     │
-                 │                                     └→ rerank → END          │
-                 └─────────────────────────────────────────────────────────────┘
-                                        ↓
-                                    generate → END
+START → route（意图路由）
+          ├── direct → generate_direct → END          # 闲聊/通用任务：不检索，直接答
+          └── rag ──┐
+                    ▼
+     ┌──────────────── 检索子图（非流式与流式共用）────────────────┐
+     │ query_rewrite → retrieve → grade ──┬→ increment_iteration ─┤
+     │                                    └→ rerank → END          │
+     └─────────────────────────────────────────────────────────────┘
+                    ▼
+              generate → END
 ```
 
 - `GET  /api/v1/health`       轻量存活检查（无外部调用，但状态真实计算）
 - `GET  /api/v1/health/ready` 就绪检查（ping Milvus + schema 校验，未就绪 503）
-- 流式接口只复用「检索子图」，生成阶段走 LLM token 流，**不重复实现检索逻辑**
+- 流式接口复用**同一套路由 + 检索子图**，生成阶段走 LLM token 流，**不重复实现检索逻辑**
 
 ### 目录结构
 
@@ -158,7 +194,7 @@ app/
 │   ├── embeddings.py       # DashScope Embedding（懒加载 + 缓存）
 │   ├── vector_store.py     # Milvus（动态字段 / 真删除 / 全量遍历 / schema 兼容检查）
 │   ├── bm25_retriever.py   # BM25（构建一次，复用）
-│   ├── reranker.py         # Cross-Encoder（device 可配 + 失败降级）
+│   ├── reranker.py         # qwen3.7-text-rerank 优先 + 本地 Cross-Encoder 兜底
 │   ├── query_processor.py  # 一次调用完成改写 + 多查询扩展
 │   ├── documents.py        # Document 副本 / 去重 key / 正文取值
 │   ├── cache.py            # Embedding LRU + 查询 TTL（可失效）
@@ -218,14 +254,23 @@ python -m app.main
 | `EMBEDDING_DIMENSION` | `1536` | 必须落在模型允许集合内（v4: 2048/1536/1024/768/512/256/128/64） |
 | `EMBEDDING_BATCH_SIZE` | `10` | 单请求行数，不得超过模型上限（v4=10，v2=25） |
 | `EMBEDDING_QUERY_INSTRUCT` | 一句检索指令 | 查询侧 `instruct`（仅 v3/v4；留空则不发） |
-| `ALLOW_LLM_FALLBACK` | `false` | 检索不到内容时是否允许脱离知识库作答；false = 直接拒答 |
+| `ROUTER_ENABLED` | `true` | 意图路由总开关；false = 所有请求都走知识库检索（旧行为） |
+| `ROUTER_LLM_ENABLED` | `true` | 仅对规则判不了的“模糊短句”允许一次极小 LLM 分类 |
+| `ROUTER_LONG_TEXT_THRESHOLD` | `12` | 超过该长度直接按“实质性提问”走检索 |
+| `ALLOW_LLM_FALLBACK` | `false` | 仅约束 RAG 路径：检索不到内容时是否允许脱离知识库作答 |
+| `LLM_STRUCTURED_DISABLE_THINKING` | `true` | 结构化调用（Query 规划 / CRAG 评分）关闭 DeepSeek 思考模式：思考模式不支持强制 `tool_choice`，且会忽略 `temperature` |
 | `VECTOR_WEIGHT` / `BM25_WEIGHT` | `1.0` / `1.0` | 加权 RRF 的通道权重 |
 | `RETRIEVAL_CANDIDATE_K` | `20` | 召回候选数；CRAG 重试时自动放宽 |
 | `CRAG_MAX_ITERATIONS` | `2` | 最大重检索轮数 |
 | `CRAG_MAX_GRADE_DOCS` | `20` | 单次批量评分的文档数上限 |
 | `CRAG_MIN_RELEVANT` | `1` | 至少命中几篇才算“相关” |
+| `RERANK_PROVIDER` | `dashscope` | `dashscope` = 走 `qwen3.7-text-rerank`（异常自动降级本地）；`local` = 只用本地模型 |
+| `RERANK_API_MODEL` | `qwen3.7-text-rerank` | 商业重排模型（复用 `DASHSCOPE_API_KEY`） |
+| `RERANK_API_TIMEOUT` / `RERANK_API_COOLDOWN` | `10` / `60` | API 超时与失败后的熔断冷却（秒，冷却期内直接走本地） |
+| `RERANK_API_MAX_CHARS` / `RERANK_API_MAX_DOCS` | `4000` / `50` | 单条文档截断字符数 / 单次请求最多送排文档数 |
+| `RERANKER_MODEL` | `BAAI/bge-reranker-base` | 本地兜底 CrossEncoder（API 异常时使用） |
 | `RERANKER_DEVICE` | `cpu` | `cpu` / `cuda` / `cuda:0` / `mps` / `auto` |
-| `RERANK_MIN_SCORE` | `0` | 低于该分数直接丢弃（>0 才生效） |
+| `RERANK_MIN_SCORE` | `0` | 低于该分数直接丢弃（>0 才生效；API 分数范围 0~1） |
 | `QUERY_REWRITE_ENABLED` / `MULTI_QUERY_ENABLED` | `true` | 关闭后检索 query 不再改写，CRAG 也不会重试 |
 | `CONTEXT_MAX_CHARS` | `12000` | 拼进 prompt 的上下文字符上限 |
 | `REQUEST_TIMEOUT` | `120` | 单次问答总超时（秒） |
@@ -259,9 +304,10 @@ python -m app.main
 
 ```json
 {
-  "used_fallback": false,   // true = 本次回答没有知识库依据
+  "route": "rag",           // rag = 走了知识库检索；direct = 通用直答（未检索知识库）
+  "used_fallback": false,   // true = 本次回答没有知识库依据（direct 时恒为 true）
   "degraded": false,        // true = 发生了降级（BM25 空 / 评分失败等）
-  "notes": [],              // 降级原因与策略说明
+  "notes": [],              // 降级原因与策略说明（含意图路由理由）
   "crag_iterations": 0,
   "cached": false
 }
@@ -325,7 +371,7 @@ docker compose -f docker/docker-compose.yml --profile milvus up -d
 2. 会话存储为进程内 dict：重启即丢，`SESSION_MAX_COUNT` 防内存无限增长。
 3. 文档解析不支持扫描版 PDF 的版面还原（表格是 Markdown 近似）。
 4. `.doc` 老格式依赖 antiword / textract / Word COM 之一，缺失时给出明确提示。
-5. 重排模型首次启动会下载（约 300MB），建议挂载 HF 缓存目录。
+5. 本地重排模型首次启动会下载（约 300MB）；它现在是 `qwen3.7-text-rerank` 的兜底通道，建议挂载 HF 缓存目录（`RERANK_PROVIDER=local` 时完全不走 API）。
 6. 没有内置限流/配额：`API_AUTH_TOKEN` 只是最简鉴权，公网部署请放在网关后面。
 
 ## 11. 排错
@@ -337,9 +383,14 @@ docker compose -f docker/docker-compose.yml --profile milvus up -d
 | 上传返回 `schema 不兼容` | `MILVUS_COLLECTION` 指向了其它项目的集合，换一个专用集合名（或 `MILVUS_DROP_OLD=true` 重建） |
 | `/health/ready` 返回 503 | 看响应里的 `milvus.status / schema / llm_configured`；`row_count` 需要 flush 才准确，正常现象 |
 | 问答一直 `used_fallback=true` | 知识库为空或检索不到；先 `/documents/list` 确认数据，再看 `notes` |
-| 问答 120s 超时且日志里没有任何节点输出 | ①`LLMService._variant` 自死锁（已在 2.7 修复）；②DeepSeek 不支持 `json_schema`，`with_structured_output` 会 400 并走文本兜底（`notes` 里会出现“CRAG 评分失败”） |
+| 说“你好”也被拒答 / 闲聊很慢 | 检查 `ROUTER_ENABLED` 是否为 `true`；若为 false 则所有请求都会走 RAG |
+| 闲聊被误判成知识问题 | 在 `app/core/intent_router.py` 的 `_CHITCHAT` / `_TASK_VERBS` 里补规则，或调大 `ROUTER_LLM_ENABLED` 让模型兜底 |
+| 问答 120s 超时且日志里没有任何节点输出 | ①`LLMService._variant` 自死锁（已在 2.7 修复）；②DeepSeek 不支持 `json_schema`，`with_structured_output` 已显式改用 `function_calling`；若仍 400 看下一条 |
+| 日志出现 `Thinking mode does not support this tool_choice` | `deepseek-flash` 默认开启思考模式，思考模式不允许强制指定 `tool_choice`；`LLM_STRUCTURED_DISABLE_THINKING=true`（默认）会在结构化调用中关闭思考 |
 | `documents/list` 返回 0 但问答有来源 | 动态字段被字段裁剪误杀（已在 2.7 修复）；确认 `_fit_document` 不过滤动态字段 |
 | 上传报 `Embedding 维度不符` | `EMBEDDING_DIMENSION` 与模型默认维度或 Milvus 集合维度不一致 |
+| 日志出现 `[rerank] qwen3.7-text-rerank 调用失败，降级本地 Cross-Encoder` | 检查 `DASHSCOPE_API_KEY`、百炼限流与网络；`RERANK_API_COOLDOWN` 内自动走本地，冷却结束后自动重试 API |
+| 重排结果与旧版排序差异较大 | API 的 `relevance_score` 为 0~1 的相对分数，本地 CrossEncoder 是 logits；使用 `RERANK_MIN_SCORE` 时注意两种分数量纲不同 |
 | `paddleocr` 报参数错误 | v3 改了 API，已用 `app/parsers/ocr_engine.py` 兼容；若仍失败请锁 `paddleocr<3` |
 
 ## License

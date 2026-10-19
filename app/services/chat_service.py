@@ -17,6 +17,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, Optional
 from app.config import settings
 from app.core.cache import query_cache
 from app.core.exceptions import RAGException
+from app.core.intent_router import ROUTE_DIRECT, classify_intent
 from app.core.langsmith import traceable
 from app.core.llm import get_llm_service
 from app.graph import nodes as graph_nodes
@@ -119,6 +120,7 @@ class ChatService:
             "notes": notes,
             "crag_iterations": int(result_state.get("iteration", 0) or 0),
             "rewritten_query": result_state.get("rewritten_query", question),
+            "route": result_state.get("route", "rag"),
             "cached": False,
         }
 
@@ -152,6 +154,36 @@ class ChatService:
 
         try:
             yield {"event": "start", "data": {"question": question}}
+
+            # 意图路由：闲聊/通用任务直接作答，避免无意义的检索开销
+            decision = await asyncio.to_thread(classify_intent, question, history)
+            if decision.is_direct:
+                yield {
+                    "event": "progress",
+                    "data": {"step": "direct", "message": "通用对话，直接作答...", "progress": 20},
+                }
+                yield {"event": "sources", "data": {"sources": []}}
+
+                messages = graph_nodes.build_direct_messages(question, history)
+                async for chunk in get_llm_service().astream_messages(
+                    messages, temperature=temperature, max_tokens=max_tokens
+                ):
+                    full_answer += chunk
+                    yield {"event": "answer", "data": {"text": chunk, "done": False}}
+
+                yield {"event": "answer", "data": {"text": "", "done": True}}
+                yield {
+                    "event": "complete",
+                    "data": {
+                        "message": "处理完成",
+                        "route": ROUTE_DIRECT,
+                        "used_fallback": True,
+                        "degraded": False,
+                        "notes": [f"意图路由：直接作答（{decision.reason}）"],
+                    },
+                }
+                completed = True
+                return
 
             yield {
                 "event": "progress",
@@ -220,6 +252,7 @@ class ChatService:
                 "event": "complete",
                 "data": {
                     "message": "处理完成",
+                    "route": "rag",
                     "used_fallback": not has_context,
                     "degraded": bool(retrieval_state.get("degraded")),
                     "notes": list(retrieval_state.get("notes") or []),

@@ -37,6 +37,7 @@ START_TIME = time.time()
 
 def _collect_services() -> Dict[str, Any]:
     store = get_vector_store_service()
+    reranker = get_reranker_service()
     return {
         "milvus": {
             "status": "connected" if store.is_connected() else "disconnected",
@@ -60,8 +61,11 @@ def _collect_services() -> Dict[str, Any]:
             "documents": get_bm25_service().count,
         },
         "reranker": {
-            "status": "ready" if get_reranker_service().is_available() else "degraded",
-            "model": settings.RERANKER_MODEL,
+            "status": "ready" if reranker.is_available() else "degraded",
+            "provider": reranker.provider,
+            "model": reranker.active_model,
+            "local_model": reranker.model_name,
+            "local_ready": reranker.is_local_available(),
         },
         "langsmith": {"status": "enabled" if settings.langsmith_enabled else "disabled"},
     }

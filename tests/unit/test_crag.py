@@ -15,9 +15,19 @@ def _make_docs(make_document, count):
     ]
 
 
-def test_route_to_retry_when_nothing_relevant_and_iterations_left():
-    state = {"is_relevant": False, "iteration": 0}
+def test_route_to_retry_when_nothing_relevant_and_iterations_left(make_document):
+    state = {
+        "is_relevant": False,
+        "iteration": 0,
+        "documents": [make_document("召回到了但都判为不相关")],
+    }
     assert decide_after_grade(state) == "rewrite_retrieve"
+
+
+def test_route_skips_retry_when_nothing_retrieved():
+    """一条候选都没有（知识库为空/向量库不可用）时，重检索毫无意义"""
+    state = {"is_relevant": False, "iteration": 0, "documents": []}
+    assert decide_after_grade(state) == "rerank"
 
 
 def test_route_to_rerank_when_relevant():

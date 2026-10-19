@@ -64,6 +64,8 @@ def fake_llm(monkeypatch):
         fake = _FakeLLM()
         monkeypatch.setattr("app.graph.nodes.get_llm_service", lambda: fake)
         monkeypatch.setattr("app.core.query_processor.get_llm_service", lambda: fake)
+        # 意图路由在“模糊短句”上也会调 LLM，测试里必须一并替换，避免真实请求
+        monkeypatch.setattr("app.core.intent_router.get_llm_service", lambda: fake)
         return fake
 
     return _install

@@ -681,7 +681,10 @@
                     if (result.data.used_fallback) {
                         const warn = document.createElement('div');
                         warn.className = 'sources';
-                        warn.innerHTML = '<strong>⚠️ 未命中知识库：</strong>本次回答没有可引用的知识库依据。';
+                        // route=direct 表示走了“通用直答”（闲聊/写作/翻译等），属于正常行为
+                        warn.innerHTML = (result.data.route === 'direct')
+                            ? '<strong>💬 通用回答：</strong>本次对话未检索知识库（闲聊 / 通用任务）。'
+                            : '<strong>⚠️ 未命中知识库：</strong>本次回答没有可引用的知识库依据。';
                         messagesArea.lastChild.appendChild(warn);
                     }
                     if (result.data.degraded && result.data.notes && result.data.notes.length) {

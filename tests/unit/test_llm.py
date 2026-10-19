@@ -87,3 +87,44 @@ def test_lock_is_reentrant():
         service._lock.release()
     finally:
         service._lock.release()
+
+
+class StructuredStub:
+    """记录 structured() 最终绑定参数的假模型"""
+
+    def __init__(self, **kwargs) -> None:
+        self.extra_body = kwargs.get("extra_body")
+        self.structured_kwargs = None
+
+    def model_copy(self, update=None):
+        data = {"extra_body": getattr(self, "extra_body", None)}
+        data.update(update or {})
+        return StructuredStub(**data)
+
+    def with_structured_output(self, schema, **kwargs):
+        self.structured_kwargs = kwargs
+        return self
+
+
+def test_structured_disables_thinking_and_uses_function_calling(monkeypatch):
+    """DeepSeek 思考模式不支持强制 tool_choice，结构化调用必须关闭思考"""
+    monkeypatch.setattr(llm_module, "init_chat_model", lambda **kwargs: StructuredStub())
+    monkeypatch.setattr(llm_module.settings, "LLM_STRUCTURED_DISABLE_THINKING", True)
+    service = llm_module.LLMService()
+
+    runnable = service.structured(dict)
+
+    assert runnable.extra_body == {"thinking": {"type": "disabled"}}
+    assert runnable.structured_kwargs["method"] == "function_calling"
+
+
+def test_structured_keeps_thinking_when_switch_off(monkeypatch):
+    """关掉开关时不应注入 thinking 参数，但 function_calling 仍须显式指定"""
+    monkeypatch.setattr(llm_module, "init_chat_model", lambda **kwargs: StructuredStub())
+    monkeypatch.setattr(llm_module.settings, "LLM_STRUCTURED_DISABLE_THINKING", False)
+    service = llm_module.LLMService()
+
+    runnable = service.structured(dict)
+
+    assert runnable.extra_body is None
+    assert runnable.structured_kwargs["method"] == "function_calling"

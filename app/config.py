@@ -121,6 +121,10 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = Field(0.7, ge=0.0, le=2.0)
     LLM_TIMEOUT: float = Field(60.0, gt=0, le=600)
     LLM_MAX_RETRIES: int = Field(2, ge=0, le=10)
+    # 结构化输出（Query 规划 / CRAG 评分）是否关闭 DeepSeek 思考模式：
+    # deepseek-flash 默认开启思考，而思考模式不支持强制 tool_choice（function_calling 会 400），
+    # 且会忽略 temperature；结构化任务本身也不需要思维链
+    LLM_STRUCTURED_DISABLE_THINKING: bool = True
 
     # ============ 文本分割配置 ============
     CHUNK_SIZE: int = Field(800, ge=100, le=4000)
@@ -176,6 +180,22 @@ class Settings(BaseSettings):
 
     # 重排序
     RERANK_ENABLED: bool = True
+    # 主通道：dashscope = 阿里百炼 qwen3.7-text-rerank（异常自动降级本地）；local = 仅本地 Cross-Encoder
+    RERANK_PROVIDER: str = "dashscope"
+    # 商业 API 重排（复用 DASHSCOPE_API_KEY）
+    RERANK_API_MODEL: str = "qwen3.7-text-rerank"
+    RERANK_API_TIMEOUT: float = Field(10.0, gt=0, le=120)
+    # 自定义排序任务说明（英文效果更好；留空则使用模型默认的问答检索策略）
+    RERANK_API_INSTRUCT: str = (
+        "Given a user question, retrieve the passages from the knowledge base that answer it"
+    )
+    # 送进 API 的单条文档截断字符数（模型单条上限 30000 token，留足余量）
+    RERANK_API_MAX_CHARS: int = Field(4000, ge=100, le=30000)
+    # 单次请求最多送进 API 的文档数（模型上限 500；默认值同时控制请求 token 总量）
+    RERANK_API_MAX_DOCS: int = Field(50, ge=1, le=500)
+    # API 连续失败后的冷却时间（秒），期间直接走本地，避免反复白等超时
+    RERANK_API_COOLDOWN: float = Field(60.0, ge=0.0, le=3600.0)
+    # 本地兜底通道
     RERANKER_MODEL: str = "BAAI/bge-reranker-base"
     RERANKER_DEVICE: str = "cpu"
     RERANK_TOP_K: int = Field(5, ge=1, le=20)
@@ -187,6 +207,16 @@ class Settings(BaseSettings):
 
     # 生成
     ALLOW_LLM_FALLBACK: bool = False  # 无检索结果时是否允许脱离知识库作答
+
+    # ============ 意图路由（Adaptive RAG）============
+    # 开启后先判断“这句话需不需要查知识库”：
+    #   闲聊/寒暄/写作/翻译等 → 直接作答（不检索、不浪费 Embedding 与 LLM 评分）
+    #   知识类问题 → 走完整 RAG 链路
+    ROUTER_ENABLED: bool = True
+    # 仅对规则无法判定的“模糊短句”才调用一次极小 LLM 分类（max_tokens=4）
+    ROUTER_LLM_ENABLED: bool = True
+    # 超过该长度视为“实质性提问”，直接走检索，避免无谓的 LLM 分类
+    ROUTER_LONG_TEXT_THRESHOLD: int = Field(12, ge=4, le=200)
 
     # 缓存
     CACHE_ENABLED: bool = True
@@ -250,6 +280,8 @@ class Settings(BaseSettings):
             raise ValueError("VECTOR_WEIGHT 与 BM25_WEIGHT 不能同时为 0")
         if self.RERANKER_DEVICE not in {"cpu", "cuda", "mps", "auto"} and not self.RERANKER_DEVICE.startswith("cuda:"):
             raise ValueError("RERANKER_DEVICE 仅支持 cpu / cuda / cuda:N / mps / auto")
+        if (self.RERANK_PROVIDER or "").strip().lower() not in {"dashscope", "local"}:
+            raise ValueError("RERANK_PROVIDER 仅支持 dashscope / local")
         return self
 
     # ============ 必需密钥的延迟校验 ============

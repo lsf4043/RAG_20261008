@@ -59,7 +59,7 @@ class LLMService:
         settings.require_deepseek_key()
         return init_chat_model(
             model=self.model,
-            model_provider="openai",
+            model_provider="deepseek",
             api_key=settings.DEEPSEEK_API_KEY,
             base_url=settings.DEEPSEEK_BASE_URL,
             temperature=self.temperature,
@@ -106,8 +106,19 @@ class LLMService:
             return variant
 
     def structured(self, schema: Any, temperature: float = 0.0, max_tokens: Optional[int] = None) -> Any:
-        """返回绑定了结构化输出 schema 的 runnable"""
-        return self._variant(temperature=temperature, max_tokens=max_tokens).with_structured_output(schema)
+        """返回绑定了结构化输出 schema 的 runnable
+
+        DeepSeek 的 deepseek-flash 默认开启思考模式，而思考模式既不支持强制
+        ``tool_choice``（function_calling 路径会 400），也会忽略 temperature。
+        因此结构化调用默认关闭思考，并显式指定 function_calling，避免
+        json_schema 在 DeepSeek 上不可用。
+        """
+        llm = self._variant(temperature=temperature, max_tokens=max_tokens)
+        if settings.LLM_STRUCTURED_DISABLE_THINKING:
+            extra_body = dict(getattr(llm, "extra_body", None) or {})
+            extra_body.setdefault("thinking", {"type": "disabled"})
+            llm = llm.model_copy(update={"extra_body": extra_body})
+        return llm.with_structured_output(schema, method="function_calling")
 
     # ---------- 消息转换 ----------
     def _to_messages(

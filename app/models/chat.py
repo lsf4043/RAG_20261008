@@ -68,6 +68,7 @@ class ChatData(BaseModel):
     logs: List[LogEntry] = Field(default_factory=list)
     session_id: Optional[str] = None
     used_fallback: bool = Field(False, description="是否脱离知识库作答（True 表示答案无知识库依据）")
+    route: str = Field("rag", description="意图路由结果：rag=知识库检索，direct=通用直答（未检索知识库）")
     degraded: bool = Field(False, description="是否发生降级（BM25 缺失 / 评分失败等）")
     notes: List[str] = Field(default_factory=list, description="降级与策略说明")
     crag_iterations: int = 0
