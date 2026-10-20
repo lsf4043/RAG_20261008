@@ -161,6 +161,17 @@ class Settings(BaseSettings):
     # ============ RAG 检索策略 ============
     RETRIEVAL_TOP_K: int = Field(5, ge=1, le=50)            # 最终进入生成的文档数
     RETRIEVAL_CANDIDATE_K: int = Field(20, ge=1, le=200)    # 召回候选数（重排前）
+    # 相似度门控：向量检索最高分低于该值时，判定“知识库无相关内容”，
+    # 直接走通用知识作答（跳过 CRAG 评分与重排，常识问题可从 ~17s 降到 ~3s）。
+    # 该阈值与 Embedding 模型强相关，必须按自己的语料标定；设为 0 表示关闭。
+    #
+    # 标定依据（text-embedding-v4 + 简历/论文语料，cos 最高分）：
+    #   相关问题：0.34(我的籍贯) 0.51(论文结论) 0.55(简历技能) 0.56(论文方法) 0.58(Milvus)
+    #   无关问题：0.21(重庆火锅) 0.25(推荐小说) 0.30(咸阳美食) 0.31(天气) 0.36(宝鸡美食)
+    # 注意：两组有重叠（相关最低 0.34 < 无关最高 0.36），**余弦无法单独判定“有没有答案”**。
+    # 所以这里只用来短路“明显无关”的查询，不承担“能不能答”的判断——
+    # 后者由生成模型读证据后声明 [[KB]] / [[GENERAL]] 决定（见 nodes.py）。
+    RETRIEVAL_MIN_SCORE: float = Field(0.25, ge=0.0, le=1.0)
     RRF_K: int = Field(60, ge=1, le=200)                    # RRF 平滑常数
     VECTOR_WEIGHT: float = Field(1.0, ge=0.0, le=10.0)      # 混合检索中向量通道权重
     BM25_WEIGHT: float = Field(1.0, ge=0.0, le=10.0)        # 混合检索中 BM25 通道权重
@@ -172,8 +183,13 @@ class Settings(BaseSettings):
     MULTI_QUERY_NUM: int = Field(3, ge=1, le=8)
     HYDE_ENABLED: bool = False
 
-    # CRAG
-    CRAG_ENABLED: bool = True
+    # CRAG（Corrective RAG）
+    # 默认关闭：它的“逐篇相关性过滤”与 Cross-Encoder 重排 + RETRIEVAL_MIN_SCORE 高度重叠，
+    # 而“检索失败→重写再查”在单域知识库里基本无效（库里没有的内容重写也查不到），
+    # 常态成本却是每个问题 1~3 次额外 LLM 调用、2~8s 延迟。
+    # 何时开启：语料嘈杂、top-k 经常混入大量无关片段，或将来接入了联网兜底
+    # （CRAG 原论文的“纠正”是转去 web search）。开启前建议先跑 RAGAS 消融确认收益。
+    CRAG_ENABLED: bool = False
     CRAG_MAX_ITERATIONS: int = Field(2, ge=0, le=5)
     CRAG_MAX_GRADE_DOCS: int = Field(20, ge=1, le=100)   # 单次评分最多送进 LLM 的文档数
     CRAG_MIN_RELEVANT: int = Field(1, ge=1)               # 至少命中几篇才算“相关”
@@ -199,24 +215,51 @@ class Settings(BaseSettings):
     RERANKER_MODEL: str = "BAAI/bge-reranker-base"
     RERANKER_DEVICE: str = "cpu"
     RERANK_TOP_K: int = Field(5, ge=1, le=20)
-    RERANK_MIN_SCORE: float = Field(0.0, ge=-100.0, le=100.0)  # 低于该分数直接丢弃
+    # 重排分数下限：**默认关闭（0）**。
+    # 曾经用它做“库里有没有答案”的判定，但实测相关最低 0.43 / 无关最高 0.39，
+    # 只差 0.04，属于“拟合出来的阈值”，会出现 0.401 走知识库、0.399 走通用知识的悬崖。
+    # 现在改由生成模型读证据后声明来源（[[KB]] / [[GENERAL]]），这个值只作为可选的
+    # 噪声预过滤保留：设成 >0 时才会丢弃低分文档。
+    RERANK_MIN_SCORE: float = Field(0.0, ge=-100.0, le=100.0)
 
     # HuggingFace 模型下载源（国内网络直连 huggingface.co 常因证书校验失败，
     # 默认走镜像；海外环境可在 .env 中设为 https://huggingface.co）
     HF_ENDPOINT: str = "https://hf-mirror.com"
 
-    # 生成
-    ALLOW_LLM_FALLBACK: bool = False  # 无检索结果时是否允许脱离知识库作答
+    # 时区：用于把“当前时间”注入提示词（模型自己不知道今天是几号）
+    APP_TIMEZONE: str = "Asia/Shanghai"
 
-    # ============ 意图路由（Adaptive RAG）============
-    # 开启后先判断“这句话需不需要查知识库”：
-    #   闲聊/寒暄/写作/翻译等 → 直接作答（不检索、不浪费 Embedding 与 LLM 评分）
-    #   知识类问题 → 走完整 RAG 链路
+    # 生成策略：知识库检索不到内容时，是否允许用大模型的通用知识作答
+    # 产品决策：默认开启（闲聊直答 / 知识类先查库 / 查不到→通用知识作答，并在响应里标注）
+    # 严格合规场景可设为 false：查不到就明确拒答
+    ALLOW_LLM_FALLBACK: bool = True
+
+    # ============ 联网检索（可选，默认关闭）============
+    # 触发条件：知识库不足以回答（无候选，或最高重排分 < WEB_SEARCH_MIN_SCORE）
+    # 且 WEB_SEARCH_ENABLED=true。联网也失败时回落到通用知识作答。
+    WEB_SEARCH_ENABLED: bool = True
+    # deepseek：官方 Search API（POST /v1/tools/search，复用 DEEPSEEK_API_KEY）
+    #     **推荐**：结构化结果（rerank_score 0~3 / authority / date / summary 600~800 字），
+    #     比抓 HTML 稳定；按成功请求计费（$0.75 / 1000 次）
+    # so：360 搜索，免 Key，中文长尾不错（但要解析 HTML）
+    # bing：免 Key，中文长尾很差（会把“周原镇党委书记”拆成“周”字）
+    # duckduckgo：免 Key，需要能访问外网
+    # tavily：需要自己的 API Key，结果稳定
+    WEB_SEARCH_PROVIDER: str = "deepseek"
+    WEB_SEARCH_API_KEY: str = ""
+    # 取多少条结果。DeepSeek Search 按“请求”计费，与 count 无关，取 5 条覆盖更好
+    WEB_SEARCH_MAX_RESULTS: int = Field(5, ge=1, le=10)
+    WEB_SEARCH_TIMEOUT: float = Field(10.0, gt=0, le=60)
+    # 知识库最高重排分低于该值时才去联网（高于它就认为库里有答案）
+    WEB_SEARCH_MIN_SCORE: float = Field(0.35, ge=0.0, le=1.0)
+    # 拼进 prompt 的网页摘要总字符上限
+    WEB_SEARCH_MAX_CHARS: int = Field(4000, ge=200)
+
+    # ============ 意图路由 ============
+    # 只做一件事：识别“闲聊/寒暄”走直答（闭集、零成本、误判代价极低）。
+    # 其余一切输入都先检索知识库，检索不到再由生成节点用通用知识作答。
+    # 不再用规则判断“是不是知识问题”——那类语义判断必然漏（见 README 2.8）。
     ROUTER_ENABLED: bool = True
-    # 仅对规则无法判定的“模糊短句”才调用一次极小 LLM 分类（max_tokens=4）
-    ROUTER_LLM_ENABLED: bool = True
-    # 超过该长度视为“实质性提问”，直接走检索，避免无谓的 LLM 分类
-    ROUTER_LONG_TEXT_THRESHOLD: int = Field(12, ge=4, le=200)
 
     # 缓存
     CACHE_ENABLED: bool = True
@@ -282,6 +325,16 @@ class Settings(BaseSettings):
             raise ValueError("RERANKER_DEVICE 仅支持 cpu / cuda / cuda:N / mps / auto")
         if (self.RERANK_PROVIDER or "").strip().lower() not in {"dashscope", "local"}:
             raise ValueError("RERANK_PROVIDER 仅支持 dashscope / local")
+        if (self.WEB_SEARCH_PROVIDER or "").strip().lower() not in {
+            "deepseek",
+            "so",
+            "bing",
+            "duckduckgo",
+            "tavily",
+        }:
+            raise ValueError("WEB_SEARCH_PROVIDER 仅支持 deepseek / so / bing / duckduckgo / tavily")
+        if self.WEB_SEARCH_ENABLED and self.WEB_SEARCH_PROVIDER.strip().lower() == "tavily" and not self.WEB_SEARCH_API_KEY:
+            raise ValueError("WEB_SEARCH_PROVIDER=tavily 需要配置 WEB_SEARCH_API_KEY")
         return self
 
     # ============ 必需密钥的延迟校验 ============

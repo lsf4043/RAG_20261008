@@ -17,7 +17,13 @@ from typing import Any, AsyncGenerator, Callable, Dict, Optional
 from app.config import settings
 from app.core.cache import query_cache
 from app.core.exceptions import RAGException
-from app.core.intent_router import ROUTE_DIRECT, classify_intent
+from app.core.intent_router import (
+    ROUTE_DIRECT,
+    ROUTE_DIRECT_FALLBACK,
+    ROUTE_RAG,
+    ROUTE_WEB,
+    classify_intent,
+)
 from app.core.langsmith import traceable
 from app.core.llm import get_llm_service
 from app.graph import nodes as graph_nodes
@@ -201,61 +207,157 @@ class ChatService:
                 ) from exc
 
             documents = list(retrieval_state.get("documents") or [])
-            used_fallback = not documents and not settings.ALLOW_LLM_FALLBACK
+            notes = list(retrieval_state.get("notes") or [])
+            degraded = bool(retrieval_state.get("degraded"))
+            merged_state = {**state, **retrieval_state}
 
-            if used_fallback:
-                full_answer = graph_nodes.NO_CONTEXT_ANSWER
-                yield {"event": "sources", "data": {"sources": []}}
-                yield {"event": "answer", "data": {"text": full_answer, "done": False}}
-                yield {"event": "answer", "data": {"text": "", "done": True}}
-                yield {
-                    "event": "complete",
-                    "data": {
-                        "message": "知识库中未找到相关内容",
-                        "used_fallback": True,
-                        "degraded": bool(retrieval_state.get("degraded")),
-                        "notes": list(retrieval_state.get("notes") or []),
-                    },
-                }
-                completed = True
-                return
+            route = "rag"
+            used_fallback = False
+            kb_answered = False
 
-            sources = []
-            for doc in documents[:3]:
-                metadata = doc.metadata or {}
-                sources.append(
+            def _kb_source_list(items):
+                return [
                     {
                         "text": graph_nodes.doc_text(doc)[:200],
-                        "score": metadata.get("rerank_score", metadata.get("rrf_score", 0.0)),
-                        "document_name": metadata.get("document_name", "未知文档"),
-                        "page_num": metadata.get("page_num", 0),
-                        "title": metadata.get("title", ""),
+                        "score": (doc.metadata or {}).get(
+                            "rerank_score", (doc.metadata or {}).get("rrf_score", 0.0)
+                        ),
+                        "document_name": (doc.metadata or {}).get("document_name", "未知文档"),
+                        "page_num": (doc.metadata or {}).get("page_num", 0),
+                        "title": (doc.metadata or {}).get("title", ""),
                     }
+                    for doc in items[:3]
+                ]
+
+            # ---------- 第一级：知识库（模型声明 [[KB]] / [[GENERAL]]）----------
+            if documents:
+                yield {
+                    "event": "progress",
+                    "data": {"step": "generating", "message": "正在生成回答...", "progress": 60},
+                }
+                messages, _ = graph_nodes.build_generation_messages(question, history, documents)
+                kb_sources = _kb_source_list(documents)
+                buffer = ""
+                decided = False
+                general_declared = False
+
+                async for chunk in get_llm_service().astream_messages(
+                    messages, temperature=temperature, max_tokens=max_tokens
+                ):
+                    if decided:
+                        full_answer += chunk
+                        yield {"event": "answer", "data": {"text": chunk, "done": False}}
+                        continue
+
+                    buffer += chunk
+                    stripped = buffer.lstrip()
+                    ready = (
+                        stripped.startswith(graph_nodes.PROVENANCE_KB)
+                        or stripped.startswith(graph_nodes.PROVENANCE_GENERAL)
+                        or "\n" in buffer
+                        or len(buffer) >= 40
+                    )
+                    if not ready:
+                        continue
+
+                    decided = True
+                    tag, body = graph_nodes.split_provenance(buffer)
+                    if tag == graph_nodes.PROVENANCE_GENERAL:
+                        general_declared = True
+                        notes = notes + ["模型判定知识库内容不足以回答"]
+                        break  # 放弃这次生成，进入下一级兜底
+
+                    yield {"event": "sources", "data": {"sources": kb_sources}}
+                    if body:
+                        full_answer += body
+                        yield {"event": "answer", "data": {"text": body, "done": False}}
+
+                if not general_declared:
+                    if not decided:
+                        tag, body = graph_nodes.split_provenance(buffer)
+                        if tag == graph_nodes.PROVENANCE_GENERAL:
+                            notes = notes + ["模型判定知识库内容不足以回答"]
+                        else:
+                            yield {"event": "sources", "data": {"sources": kb_sources}}
+                            if body:
+                                full_answer += body
+                                yield {"event": "answer", "data": {"text": body, "done": False}}
+                            kb_answered = True
+                    else:
+                        kb_answered = True
+                    if kb_answered:
+                        route = ROUTE_RAG
+                        used_fallback = False
+
+            # ---------- 第二级：联网 ----------
+            answered = kb_answered
+            if not answered and settings.WEB_SEARCH_ENABLED:
+                yield {
+                    "event": "progress",
+                    "data": {"step": "web", "message": "知识库不足，正在联网检索...", "progress": 50},
+                }
+                outcome = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        graph_nodes.web_search, {**merged_state, "notes": notes}
+                    ),
+                    timeout=settings.REQUEST_TIMEOUT,
                 )
-            yield {"event": "sources", "data": {"sources": sources}}
+                notes = list(outcome.get("notes") or notes)
+                web_documents = list(outcome.get("documents") or [])
+                if web_documents:
+                    route = ROUTE_WEB
+                    used_fallback = False
+                    yield {
+                        "event": "sources",
+                        "data": {"sources": graph_nodes.web_sources(web_documents)[:3]},
+                    }
+                    messages = graph_nodes.build_web_messages(question, history, web_documents)
+                    async for chunk in get_llm_service().astream_messages(
+                        messages, temperature=temperature, max_tokens=max_tokens
+                    ):
+                        full_answer += chunk
+                        yield {"event": "answer", "data": {"text": chunk, "done": False}}
+                    answered = True
 
-            yield {
-                "event": "progress",
-                "data": {"step": "generating", "message": "正在生成回答...", "progress": 60},
-            }
+            # ---------- 第三级：通用知识 / 拒答 ----------
+            if not answered:
+                if not settings.ALLOW_LLM_FALLBACK:
+                    full_answer = graph_nodes.NO_CONTEXT_ANSWER
+                    yield {"event": "sources", "data": {"sources": []}}
+                    yield {"event": "answer", "data": {"text": full_answer, "done": False}}
+                    yield {
+                        "event": "complete",
+                        "data": {
+                            "message": "知识库中未找到相关内容",
+                            "route": ROUTE_RAG,
+                            "used_fallback": True,
+                            "degraded": degraded,
+                            "notes": notes + ["知识库无相关依据，已按策略拒答"],
+                        },
+                    }
+                    completed = True
+                    return
 
-            messages, has_context = graph_nodes.build_generation_messages(question, history, documents)
-
-            async for chunk in get_llm_service().astream_messages(
-                messages, temperature=temperature, max_tokens=max_tokens
-            ):
-                full_answer += chunk
-                yield {"event": "answer", "data": {"text": chunk, "done": False}}
+                route = ROUTE_DIRECT_FALLBACK
+                used_fallback = True
+                notes = notes + ["知识库未命中，改用通用知识作答（非知识库依据）"]
+                yield {"event": "sources", "data": {"sources": []}}
+                messages = graph_nodes.build_direct_messages(question, history)
+                async for chunk in get_llm_service().astream_messages(
+                    messages, temperature=temperature, max_tokens=max_tokens
+                ):
+                    full_answer += chunk
+                    yield {"event": "answer", "data": {"text": chunk, "done": False}}
 
             yield {"event": "answer", "data": {"text": "", "done": True}}
             yield {
                 "event": "complete",
                 "data": {
                     "message": "处理完成",
-                    "route": "rag",
-                    "used_fallback": not has_context,
-                    "degraded": bool(retrieval_state.get("degraded")),
-                    "notes": list(retrieval_state.get("notes") or []),
+                    "route": route,
+                    "used_fallback": used_fallback,
+                    "degraded": degraded,
+                    "notes": notes,
                 },
             }
             completed = True

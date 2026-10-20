@@ -75,6 +75,10 @@ def e2e_env(monkeypatch):
     monkeypatch.setattr(settings, "MILVUS_COLLECTION", TEST_COLLECTION)
     monkeypatch.setattr(settings, "RERANK_ENABLED", False)
     monkeypatch.setattr(settings, "CRAG_MAX_GRADE_DOCS", 10)
+    # 假 Embedding 的余弦分数没有实际意义，关闭相似度门控，避免误杀检索结果
+    monkeypatch.setattr(settings, "RETRIEVAL_MIN_SCORE", 0.0)
+    # 集成测试不依赖外网：关闭联网，避免测试期间真的去搜 Bing
+    monkeypatch.setattr(settings, "WEB_SEARCH_ENABLED", False)
 
     fake_llm = FakeLLM()
     monkeypatch.setattr("app.graph.nodes.get_llm_service", lambda: fake_llm)
@@ -176,8 +180,20 @@ def test_full_rag_flow(e2e_env):
     assert e2e_env["service"].iter_documents() == []
 
     after_delete = client.post("/api/v1/chat/query", json={"question": "Milvus 是什么？", "top_k": 3})
-    assert after_delete.json()["data"]["cached"] is False, "知识库变了，不能继续命中旧缓存"
-    assert after_delete.json()["data"]["used_fallback"] is True
+    after_data = after_delete.json()["data"]
+    assert after_data["cached"] is False, "知识库变了，不能继续命中旧缓存"
+    assert after_data["used_fallback"] is True
+    # 策略：查不到 → 用通用知识作答（而不是拒答）
+    assert after_data["route"] == "direct_fallback"
+    assert after_data["sources"] == []
+    assert "知识库中没有检索到" not in after_data["answer"]
+
+    # 常识问题在空知识库下也必须能答（之前会被送去 RAG 然后拒答）
+    food = client.post("/api/v1/chat/query", json={"question": "重庆有啥吃的美食", "top_k": 3})
+    food_data = food.json()["data"]
+    assert food.status_code == 200
+    assert food_data["route"] == "direct_fallback"
+    assert "知识库中没有检索到" not in food_data["answer"]
 
 
 def test_stream_endpoint(e2e_env):

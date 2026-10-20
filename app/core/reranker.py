@@ -29,6 +29,27 @@ class ReRankAPIError(RuntimeError):
     """商业重排 API 调用异常（统一触发本地降级）"""
 
 
+def sigmoid_to_probability(value: float) -> float:
+    """
+    把本地 Cross-Encoder 的 logits 压到 0~1 的“相关度”量纲
+
+    注意：**只用于本地通道**。商业 API（qwen3.7-text-rerank）返回的已经是 0~1 的
+    relevance_score，不能再过 sigmoid（会把它压到 0.5~0.73）。
+
+    为什么必须在本地通道做这一步：`RERANK_MIN_SCORE` 是按 0~1 标定的
+    （实测相关 ≥0.43、无关 ≤0.39）；如果 API 熔断降级到本地，而本地给的是
+    logits（-10~+10），同一个阈值就会滤掉几乎所有文档。
+    sigmoid 单调，不改变排序，只统一量纲。
+    """
+    if not math.isfinite(value):
+        return 0.0
+    if value >= 30:
+        return 1.0
+    if value <= -30:
+        return 0.0
+    return 1.0 / (1.0 + math.exp(-value))
+
+
 def _field(obj: Any, name: str, default: Any = None) -> Any:
     """兼容 dashscope 返回的 dict / DictMixin / dataclass 三种形态"""
     if obj is None:
@@ -333,7 +354,7 @@ class RerankerService:
 
             scored: List[Tuple[Document, float]] = []
             for doc, score in zip(documents, raw_scores):
-                value = float(score)
+                value = sigmoid_to_probability(float(score))
                 if not math.isfinite(value):
                     raise ValueError("重排分数包含 NaN/Inf")
                 copied = copy_document(doc)

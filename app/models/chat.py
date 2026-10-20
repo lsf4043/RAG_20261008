@@ -44,6 +44,7 @@ class SourceInfo(BaseModel):
     page_num: int = 0
     title: str = ""
     chunk_id: Optional[int] = None
+    url: Optional[str] = Field(None, description="网页来源链接（联网检索时为 URL）")
 
 
 class LogEntry(BaseModel):

@@ -88,12 +88,13 @@ def build_graph():
             "rag": "retrieval",
         },
     )
+    # 生成节点内部完成“知识库 → 联网 → 通用知识”的三级兜底
     workflow.add_edge("retrieval", "generate")
     workflow.add_edge("generate", END)
     workflow.add_edge("generate_direct", END)
 
     compiled = workflow.compile()
-    logger.info("RAG 状态机编译完成（意图路由 + Agentic RAG + CRAG）")
+    logger.info("RAG 状态机编译完成（意图路由 + 三级来源兜底）")
     return compiled
 
 

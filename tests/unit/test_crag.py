@@ -1,4 +1,11 @@
-"""CRAG 决策、批量评分、无依据拒答、重检索真的换 query"""
+"""CRAG 决策、批量评分、无依据拒答、重检索真的换 query
+
+注意：CRAG 现在**默认关闭**（见 config.py 的说明）。本文件验证的是“开启 CRAG 时”的
+行为，因此统一用 fixture 强制打开；关闭时的默认行为由 test_config 与
+test_intent_router 覆盖。
+"""
+import pytest
+
 from app.config import settings
 from app.graph.nodes import (
     decide_after_grade,
@@ -6,6 +13,11 @@ from app.graph.nodes import (
     grade_documents_node,
     query_rewrite_node,
 )
+
+
+@pytest.fixture(autouse=True)
+def crag_enabled(monkeypatch):
+    monkeypatch.setattr(settings, "CRAG_ENABLED", True)
 
 
 def _make_docs(make_document, count):

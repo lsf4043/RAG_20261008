@@ -21,6 +21,14 @@ os.environ["LLM_MAX_RETRIES"] = "0"
 import pytest  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_network_by_default(monkeypatch):
+    """测试默认不联网：需要联网的用例自己把 WEB_SEARCH_ENABLED 打开并替换服务"""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "WEB_SEARCH_ENABLED", False)
+
+
 @pytest.fixture()
 def make_document():
     """构造测试用 Document 的便捷工厂"""
@@ -64,8 +72,6 @@ def fake_llm(monkeypatch):
         fake = _FakeLLM()
         monkeypatch.setattr("app.graph.nodes.get_llm_service", lambda: fake)
         monkeypatch.setattr("app.core.query_processor.get_llm_service", lambda: fake)
-        # 意图路由在“模糊短句”上也会调 LLM，测试里必须一并替换，避免真实请求
-        monkeypatch.setattr("app.core.intent_router.get_llm_service", lambda: fake)
         return fake
 
     return _install
