@@ -1,9 +1,5 @@
 """
 RAG 智能问答系统（LangGraph 版）- FastAPI 应用入口
-
-P0 修复：``lifespan`` 必须接收 app 参数。Starlette 的调用方式是
-``async with self.lifespan_context(app)``（见 starlette/routing.py），
-旧签名 ``async def lifespan():`` 会让服务在启动阶段直接抛 TypeError。
 """
 from __future__ import annotations
 

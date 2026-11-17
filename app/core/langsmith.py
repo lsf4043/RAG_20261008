@@ -29,9 +29,7 @@ def setup_langsmith() -> bool:
     os.environ["LANGSMITH_TRACING"] = "true"
     os.environ["LANGSMITH_API_KEY"] = settings.LANGSMITH_API_KEY
     os.environ["LANGSMITH_PROJECT"] = settings.LANGSMITH_PROJECT
-    if settings.LANGSMITH_ENDPOINT:
-        os.environ["LANGCHAIN_ENDPOINT"] = settings.LANGSMITH_ENDPOINT
-        os.environ["LANGSMITH_ENDPOINT"] = settings.LANGSMITH_ENDPOINT
+    os.environ["LANGSMITH_ENDPOINT"] = settings.LANGSMITH_ENDPOINT
 
     logger.info("LangSmith 追踪已启用，项目: %s", settings.LANGSMITH_PROJECT)
     return True

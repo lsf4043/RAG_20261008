@@ -2,8 +2,9 @@
 Milvus 集成测试（真实读写，验证 P0 级修复）
 
 覆盖：
-- 动态字段写入（metadata 不再被首个文档的 schema 锁死）
+- 静态 schema：集合由应用显式创建，标量字段不再被首个文档锁死
 - ``raw_content`` 与 text_field(``content``) 不再冲突
+- ``document_id`` / ``file_type`` 的 INVERTED 标量索引真实存在
 - 按 document_id 删除**真的生效**（旧实现用不存在的 JSON 路径，静默失败）
 - 文档列表聚合
 - 重启后从向量库重建 BM25
@@ -95,11 +96,40 @@ def _docs(document_id: str, count: int):
     ]
 
 
+def test_collection_uses_static_schema_and_scalar_indexes(milvus_service):
+    """集合必须是静态 schema，且标量索引按约定建好（写入时才会真正创建）"""
+    milvus_service.add_documents(_docs("doc-schema", 1))
+
+    client = milvus_service._store.client
+    info = client.describe_collection(TEST_COLLECTION)
+    field_names = {field["name"] for field in info["fields"]}
+    assert field_names >= {
+        "id",
+        "content",
+        "embedding",
+        "title",
+        "raw_content",
+        "document_id",
+        "document_name",
+        "file_type",
+        "page_num",
+        "chunk_id",
+    }
+    assert info.get("enable_dynamic_field") is False
+
+    indexes = set(client.list_indexes(TEST_COLLECTION))
+    assert "embedding" in indexes
+    assert {"document_id", "file_type"} <= indexes, f"缺少标量索引: {indexes}"
+
+    detail = client.describe_index(TEST_COLLECTION, "document_id")
+    assert detail.get("index_type") == "INVERTED"
+
+
 def test_add_search_delete_roundtrip(milvus_service):
     document_id = "doc-integration-1"
     milvus_service.add_documents(_docs(document_id, 3))
 
-    # metadata 没有被丢弃（动态字段生效）
+    # metadata 完整落库（静态 schema 下若未声明会被静默丢弃）
     documents = milvus_service.iter_documents()
     assert len(documents) == 3
     assert all(doc.metadata.get("document_id") == document_id for doc in documents)
@@ -135,6 +165,7 @@ def test_metadata_survives_reconnect(milvus_service):
     按 schema 过滤会把 document_id 等字段全部过滤掉 →
     iter_documents 拿不到元数据（BM25 去重失效、来源显示“未知文档”）、
     get_document_list 直接返回空。
+    现在静态 schema 显式声明了全部标量字段，校验与裁剪都必须放行。
     """
     from app.core.vector_store import VectorStoreService
 

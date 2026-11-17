@@ -2,10 +2,12 @@
 向量数据库服务（langchain-milvus 0.4.x / pymilvus 3.x）
 
 本次修复的关键点：
-1. **显式开启 ``enable_dynamic_field=True``**。旧实现依赖默认值 False，导致集合
-   schema 由“第一个上传的文档”的 metadata 键固化，后续新增字段被静默丢弃，
-   且 metadata 的 ``content`` 与 text_field 同名会触发 “Metadata key is reserved”。
-   现在 metadata 全部作为动态字段落库，字段可自由演进。
+1. **静态 schema（``enable_dynamic_field=False``）+ 显式标量字段声明**。
+   集合由 ``_ensure_collection_ready()`` 按 ``SCALAR_FIELDS`` 主动创建，schema 不再
+   由“第一个上传的文档”决定；``document_id`` / ``file_type`` 建 INVERTED 标量索引，
+   按 ``document_id`` 删除从全集合扫描变成索引命中。
+   代价：静态模式下 metadata 里未声明的键会被 langchain-milvus **静默丢弃**，
+   因此 ``_inspect_schema()`` 会校验 ``SCALAR_FIELDS`` 是否齐全。
 2. **删除使用顶层字段表达式** ``document_id == "..."``（旧实现用 JSON 路径去匹配
    一个并不存在的 ``metadata`` 字段，删除永远不生效）。同时对 document_id 做
    白名单校验，避免表达式注入。
@@ -23,6 +25,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from langchain_core.documents import Document
 from langchain_milvus import Milvus
+from pymilvus import DataType
 
 from app.config import settings
 from app.core.embeddings import get_embedding_service
@@ -35,6 +38,30 @@ TEXT_FIELD = "content"          # 参与向量化的文本（标题加权后的 
 VECTOR_FIELD = "embedding"
 PRIMARY_FIELD = "id"
 RAW_CONTENT_FIELD = "raw_content"   # 原始正文（与 TEXT_FIELD 区分开，避免字段名冲突）
+
+TEXT_MAX_LENGTH = 65535
+PRIMARY_MAX_LENGTH = 64
+
+# 静态 schema 的标量字段：唯一定义处，建集合、schema 校验都以此为准。
+# 新增 metadata 键必须同步加到这里，否则静态模式下会被 langchain-milvus 静默丢弃
+# （``_prepare_insert_list`` 里 ``key not in self.fields`` 直接 continue），且 Milvus
+# 的集合加字段需要重建，不会自动演进。
+SCALAR_FIELDS: Dict[str, Dict[str, Any]] = {
+    # 按 document_id 删除 / 过滤，高基数，倒排索引收益最大
+    "document_id": {"datatype": DataType.VARCHAR, "max_length": 64, "index_type": "INVERTED"},
+    # 低基数（pdf/docx/md…），做统计与过滤
+    "file_type": {"datatype": DataType.VARCHAR, "max_length": 32, "index_type": "INVERTED"},
+    # 以下只做 output_fields 投影 / 展示，不参与 filter，不建索引以免白占内存
+    "document_name": {"datatype": DataType.VARCHAR, "max_length": 512},
+    "title": {"datatype": DataType.VARCHAR, "max_length": 512},
+    "raw_content": {"datatype": DataType.VARCHAR, "max_length": TEXT_MAX_LENGTH},
+    "page_num": {"datatype": DataType.INT64},
+    "chunk_id": {"datatype": DataType.INT64},
+}
+
+VECTOR_INDEX_TYPE = "HNSW"
+VECTOR_METRIC_TYPE = "COSINE"
+VECTOR_INDEX_PARAMS = {"M": 16, "efConstruction": 128}
 
 _SAFE_ID = re.compile(r"^[0-9a-zA-Z_\-]{1,64}$")
 
@@ -57,6 +84,8 @@ class VectorStoreService:
         self._existing_fields: Optional[set] = None
         # 与当前应用 schema 不兼容的原因（None 表示兼容或集合尚不存在）
         self._incompatible_reason: Optional[str] = None
+        # 本进程内集合是否已确认（建好 + 索引齐全 + 已加载）
+        self._schema_ready = False
 
     # ==================== 连接 ====================
     def connect(self) -> bool:
@@ -71,27 +100,23 @@ class VectorStoreService:
                     collection_name=self.collection_name,
                     connection_args={"uri": uri},
                     index_params={
-                        "metric_type": "COSINE",
-                        "index_type": "HNSW",
-                        "params": {"M": 16, "efConstruction": 128},
+                        "metric_type": VECTOR_METRIC_TYPE,
+                        "index_type": VECTOR_INDEX_TYPE,
+                        "params": VECTOR_INDEX_PARAMS,
                     },
-                    search_params={"metric_type": "COSINE", "params": {"ef": 64}},
+                    search_params={"metric_type": VECTOR_METRIC_TYPE, "params": {"ef": 64}},
                     text_field=TEXT_FIELD,
                     vector_field=VECTOR_FIELD,
                     primary_field=PRIMARY_FIELD,
-                    # 关键修复：metadata 走动态字段，schema 不再被首个文档锁死
-                    enable_dynamic_field=True,
+                    # 静态 schema：字段与索引由 _ensure_collection_ready() 显式创建
+                    enable_dynamic_field=False,
                     drop_old=settings.MILVUS_DROP_OLD,
-                    # 注意：这里刻意不传 timeout。
-                    # langchain-milvus 0.4.0 的 add_embeddings() 在“集合首次创建”分支里把
-                    # timeout 写进了 kwargs 且未清理，随后 insert(..., timeout=timeout, **kwargs)
-                    # 会抛 "got multiple values for keyword argument 'timeout'"，导致首次写入
-                    # 必然失败。超时统一由 thread_pool.run_sync(timeout=...) 在外层控制。
                 )
                 # 真正验证连通性
                 store.client.list_collections()
                 self._store = store
                 self._connected = True
+                self._schema_ready = False
                 self._inspect_schema(store)
                 logger.info("Milvus 连接成功，集合: %s", self.collection_name)
                 return True
@@ -100,6 +125,107 @@ class VectorStoreService:
                 self._store = None
                 self._connected = False
                 return False
+
+    # ==================== 集合与索引 ====================
+    def _create_collection(self, client) -> None:
+        """按 SCALAR_FIELDS 显式创建集合（静态 schema，不走“首个文档定 schema”）"""
+        schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
+        schema.add_field(
+            PRIMARY_FIELD,
+            DataType.VARCHAR,
+            is_primary=True,
+            auto_id=False,
+            max_length=PRIMARY_MAX_LENGTH,
+        )
+        schema.add_field(TEXT_FIELD, DataType.VARCHAR, max_length=TEXT_MAX_LENGTH)
+        schema.add_field(VECTOR_FIELD, DataType.FLOAT_VECTOR, dim=self.dimension)
+        for name, spec in SCALAR_FIELDS.items():
+            field_params = {k: v for k, v in spec.items() if k != "index_type"}
+            schema.add_field(name, **field_params)
+
+        client.create_collection(self.collection_name, schema=schema)
+        logger.info(
+            "已创建集合 %s（静态 schema）：%s",
+            self.collection_name,
+            [PRIMARY_FIELD, TEXT_FIELD, VECTOR_FIELD, *SCALAR_FIELDS],
+        )
+
+    def _ensure_indexes(self, client) -> None:
+        """
+        补齐向量索引与标量索引（幂等）
+
+        必须在 load 之前完成：Milvus 对已加载的集合建索引会失败。
+        """
+        existing = set(client.list_indexes(self.collection_name))
+        index_params = client.prepare_index_params()
+        pending = 0
+
+        if VECTOR_FIELD not in existing:
+            index_params.add_index(
+                field_name=VECTOR_FIELD,
+                index_type=VECTOR_INDEX_TYPE,
+                metric_type=VECTOR_METRIC_TYPE,
+                params=VECTOR_INDEX_PARAMS,
+            )
+            pending += 1
+
+        for name, spec in SCALAR_FIELDS.items():
+            index_type = spec.get("index_type")
+            if index_type and name not in existing:
+                index_params.add_index(field_name=name, index_type=index_type)
+                pending += 1
+
+        if not pending:
+            return
+        client.create_index(self.collection_name, index_params)
+        logger.info("已为集合 %s 创建 %s 个索引（含标量索引）", self.collection_name, pending)
+
+    def _sync_store_fields(self, store: Milvus) -> None:
+        """
+        把集合的真实字段同步给 langchain-milvus
+
+        ``Milvus.fields`` 只在构造时从 schema 读取一次。若集合是构造之后才创建的，
+        它会一直是空列表，而 ``_prepare_insert_list`` 在静态模式下会把不在该列表里的
+        metadata 键**静默丢弃**，导致所有标量字段丢失且不报错。
+        """
+        info = store.client.describe_collection(self.collection_name)
+        names = [field["name"] for field in info.get("fields", [])]
+        if not hasattr(store, "fields"):
+            logger.warning("langchain-milvus 无 fields 属性，metadata 可能在写入时被丢弃")
+            return
+        if store.fields != names:
+            logger.info("同步 langchain-milvus 字段视图: %s", names)
+        store.fields = names
+
+    def _ensure_collection_ready(self) -> Milvus:
+        """确保集合存在、schema 兼容、索引齐全、已加载（写入前调用）"""
+        store = self._ensure_store()
+        client = store.client
+
+        if not client.has_collection(self.collection_name):
+            # 集合不存在说明没有“不兼容的旧集合”了，陈旧的告警必须清掉再重建
+            self._incompatible_reason = None
+            self._existing_fields = None
+            self._create_collection(client)
+            self._schema_ready = False
+
+        if self._schema_ready:
+            return store
+
+        self._existing_fields = None
+        self._incompatible_reason = None
+        self._inspect_schema(store)
+        if self._incompatible_reason:
+            raise MilvusException(self._incompatible_hint())
+
+        self._sync_store_fields(store)
+        self._ensure_indexes(client)
+        try:
+            client.load_collection(self.collection_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("加载集合失败（可能已加载）: %s", exc)
+        self._schema_ready = True
+        return store
 
     def _inspect_schema(self, store: Milvus) -> None:
         """
@@ -120,8 +246,6 @@ class VectorStoreService:
         except Exception as exc:  # noqa: BLE001
             logger.warning("读取集合 schema 失败: %s", exc)
             return
-
-        from pymilvus import DataType
 
         fields = {field["name"]: field for field in info.get("fields", [])}
         self._existing_fields = set(fields)
@@ -148,6 +272,26 @@ class VectorStoreService:
             dim = params.get("dim")
             if dim is not None and int(dim) != self.dimension:
                 problems.append(f"向量维度不匹配：集合 {dim} vs 配置 {self.dimension}")
+
+        # 静态 schema 下缺失的 metadata 键会被 langchain-milvus 静默丢弃，
+        # 必须在建集合/连接时就说清楚，而不是等检索结果里元数据“消失”。
+        missing = [name for name in SCALAR_FIELDS if name not in fields]
+        if missing:
+            problems.append(f"缺少标量字段 {missing}")
+        else:
+            for name, spec in SCALAR_FIELDS.items():
+                actual = fields[name].get("type")
+                expected = spec["datatype"]
+                if actual != expected:
+                    problems.append(f"标量字段 {name} 类型不匹配：集合 {actual} vs 期望 {expected}")
+                    continue
+                if expected == DataType.VARCHAR:
+                    field_params = fields[name].get("params") or {}
+                    max_length = field_params.get("max_length")
+                    if max_length is not None and int(max_length) < int(spec["max_length"]):
+                        problems.append(
+                            f"标量字段 {name} max_length 过小：集合 {max_length} vs 期望 {spec['max_length']}"
+                        )
 
         if problems:
             self._incompatible_reason = "；".join(problems)
@@ -208,18 +352,19 @@ class VectorStoreService:
         """
         计算可安全查询的字段
 
-        - 动态字段模式：schema 里只有 id/content/embedding，metadata 是动态字段，
-          **不能**按 schema 过滤，否则 document_id 等字段会被误判为不存在；
-        - 静态 schema 模式（历史遗留集合）：与真实字段取交集，避免查询报错。
+        - 静态 schema（当前默认）：与真实字段取交集，避免查询报错；
+        - 动态字段模式（仅兼容历史集合）：schema 里只有 id/content/embedding，
+          metadata 是动态字段，**不能**按 schema 过滤，否则 document_id 等字段
+          会被误判为不存在。
         """
         if self._existing_fields is None or self._uses_dynamic_fields():
             return list(requested)
         return [name for name in requested if name in self._existing_fields]
 
     def _fit_document(self, document: Document) -> Document:
-        """把 metadata 裁剪到集合已有字段，避免“未知字段”写入失败"""
+        """在静态 schema 下把 metadata 裁剪到集合已有字段"""
         if self._existing_fields is None or self._uses_dynamic_fields():
-            # 动态字段模式下任何 metadata 键都合法，绝不能过滤（否则元数据会被静默丢弃）
+            # 集合尚不存在 / 动态字段：任何 metadata 键都合法，绝不能过滤
             return document
         metadata = {
             key: value
@@ -288,11 +433,8 @@ class VectorStoreService:
     def add_documents(self, documents: List[Document]) -> List[str]:
         if not documents:
             return []
-        store = self._ensure_store()
-
-        if self._incompatible_reason:
-            # 与其让 Milvus 抛一句 “field raw_content not exist”，不如直接说清楚怎么修
-            raise MilvusException(self._incompatible_hint())
+        # 静态 schema 必须先确保集合/索引就绪，否则首个文档会撞上字段缺失
+        store = self._ensure_collection_ready()
 
         prepared = [self._fit_document(doc) for doc in documents]
         # 显式给出主键：否则 langchain-milvus 会把 auto_id 翻成 True 并自动建 INT64 主键，
